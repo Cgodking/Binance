@@ -1,21 +1,21 @@
-# Binance Futures Shadow Research Bot
+# Binance 合约影子交易研究平台
 
-Single-file Python application for Binance USD-M Futures market monitoring, deterministic shadow trading, historical replay, and walk-forward strategy validation.
+这是一个单文件 Python 应用，用于 Binance USD-M 合约行情监控、确定性影子交易、历史回放和滚动样本外策略验证。
 
-## Safety status
+## 安全状态
 
-- `DRY_RUN=true` is mandatory.
-- `SHADOW_MODE=true` is mandatory.
-- `LIVE_TRADING=false` is mandatory.
-- The current engine rejects configurations that attempt to enable live trading.
-- Runtime state, API credentials, logs, historical data, and research reports are intentionally excluded from Git.
+- 必须保持 `DRY_RUN=true`。
+- 必须保持 `SHADOW_MODE=true`。
+- 必须保持 `LIVE_TRADING=false`。
+- 当前引擎会拒绝任何尝试启用真实交易的配置。
+- 运行状态、API 凭据、日志、历史行情和研究报告均不会提交到 Git。
 
-The current cost-aware trend-pullback candidate did not pass its training gate. The repository must not be treated as evidence of a profitable strategy or as approval for live trading.
+当前成本感知趋势回调候选策略没有通过训练阶段准入门槛。本仓库不能被视为策略已经盈利的证据，也不能作为恢复真实交易的依据。
 
-## Environment
+## 运行环境
 
-- Python 3.10+
-- Linux recommended for server deployment
+- Python 3.10 或更高版本
+- 服务器部署推荐使用 Linux
 
 ```bash
 python3 -m venv .venv
@@ -24,38 +24,46 @@ python3 -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Set a strong `WEB_PASSWORD` or `WEB_AUTH_TOKEN` before exposing the Flask dashboard. Keep Binance API credentials out of Git.
+在对外开放 Flask 监控页面前，必须配置高强度的 `WEB_PASSWORD` 或 `WEB_AUTH_TOKEN`。禁止将 Binance API 凭据提交到 Git。
 
-## Run
+## 启动程序
 
 ```bash
 python3 binance_futures_zscore_bot.py
 ```
 
-The dashboard listens on port `5055` by default.
+监控页面默认监听 `5055` 端口。
 
-## Tests
+## 运行测试
 
 ```bash
 python3 -m unittest -v test_binance_futures_zscore_bot.py
 ```
 
-## Historical research
+## 历史研究
 
-Regime and strategy replay:
+运行市场状态和策略路由历史回放：
 
 ```bash
 python3 binance_futures_zscore_bot.py replay --days 180
 ```
 
-Frozen cost-aware trend-pullback candidate with independent LONG and SHORT validation:
+运行冻结参数的成本感知趋势回调候选策略，并分别验证 LONG 和 SHORT：
 
 ```bash
 python3 binance_futures_zscore_bot.py candidate-replay --days 360
 ```
 
-Historical replay uses public market data and writes generated artifacts to ignored local directories.
+历史回放仅使用公开市场数据。生成的行情缓存、交易记录和研究报告会写入已被 `.gitignore` 排除的本地目录。
 
-## Server helpers
+## 服务器辅助命令
 
-`install_binancep_commands.sh` installs the interactive configuration and process helper commands used by the server deployment. Review it before sourcing or installing it on another host.
+`install_binancep_commands.sh` 用于安装服务器上的交互式配置和进程管理命令。在其他主机执行或加载该脚本前，应先检查脚本内容并确认路径和代理设置适用于目标环境。
+
+## 重要说明
+
+- 项目目前仅用于影子交易和策略研究。
+- 历史盈利不代表未来收益。
+- 回放结果必须同时计入手续费和滑点。
+- 任何策略都必须通过训练集、验证集和测试集后，才可以进入实时影子观察阶段。
+- 未通过样本外验证前，不应启用真实交易。

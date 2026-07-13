@@ -4194,13 +4194,15 @@ def render_history_plot(state: RuntimeState, plot_type: str) -> bytes:
         data = snapshot["close_history"]
         title = "Recent Close Prices"
         ylabel = "Close"
-    figure = Figure(figsize=(8, 4), dpi=120)
+    figure = Figure(figsize=(8, 4), dpi=120, facecolor="#ffffff")
     axis = figure.subplots()
+    axis.set_facecolor("#ffffff")
     if data:
         x_values = list(range(len(data)))
         y_values = [float(item["value"]) for item in data]
         labels = [str(item.get("time", "")) for item in data]
-        axis.plot(x_values, y_values, linewidth=1.4)
+        line_color = "#087f6a" if plot_type == "zscore" else "#d7603f"
+        axis.plot(x_values, y_values, color=line_color, linewidth=1.7)
         step = max(1, math.ceil(len(x_values) / 6))
         tick_indexes = x_values[::step]
         if x_values[-1] not in tick_indexes:
@@ -4208,19 +4210,24 @@ def render_history_plot(state: RuntimeState, plot_type: str) -> bytes:
         axis.set_xticks(tick_indexes)
         axis.set_xticklabels([labels[index] for index in tick_indexes], rotation=30, ha="right", fontsize=8)
         if plot_type == "zscore":
-            axis.axhline(2.30, color="red", linestyle="--", linewidth=0.8)
-            axis.axhline(-2.30, color="green", linestyle="--", linewidth=0.8)
-            axis.axhline(-2.60, color="green", linestyle=":", linewidth=0.8)
-            axis.axhline(0.0, color="black", linestyle=":", linewidth=0.8)
+            axis.axhline(2.30, color="#d7603f", linestyle="--", linewidth=0.9)
+            axis.axhline(-2.30, color="#087f6a", linestyle="--", linewidth=0.9)
+            axis.axhline(-2.60, color="#087f6a", linestyle=":", linewidth=0.9)
+            axis.axhline(0.0, color="#89948e", linestyle=":", linewidth=0.8)
     else:
         axis.text(0.5, 0.5, "No data yet", ha="center", va="center", transform=axis.transAxes)
-    axis.set_title(title)
-    axis.set_xlabel("Time")
-    axis.set_ylabel(ylabel)
-    axis.grid(True, alpha=0.3)
+    axis.set_title(title, loc="left", fontsize=10, fontweight="bold", color="#26332d", pad=10)
+    axis.set_xlabel("Time", fontsize=8, color="#68736d")
+    axis.set_ylabel(ylabel, fontsize=8, color="#68736d")
+    axis.grid(True, color="#dce1dc", alpha=0.65, linewidth=0.7)
+    axis.tick_params(axis="both", colors="#68736d", labelsize=8, length=0)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.spines["left"].set_color("#bdc7bf")
+    axis.spines["bottom"].set_color("#bdc7bf")
     figure.tight_layout()
     buffer = io.BytesIO()
-    figure.savefig(buffer, format="png")
+    figure.savefig(buffer, format="png", facecolor="#ffffff")
     return buffer.getvalue()
 
 
@@ -4235,24 +4242,26 @@ DASHBOARD_TEMPLATE = """
     :root {
       color-scheme: light;
       font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
-      --bg: #eef2f5;
+      --bg: #f1f3f0;
       --surface: #ffffff;
-      --surface-soft: #f8fafb;
-      --line: #d9e1ea;
-      --line-strong: #bcc9d6;
-      --ink: #14202b;
-      --muted: #607080;
-      --muted-strong: #425466;
-      --nav: #101820;
-      --nav-soft: #172431;
-      --accent: #1769aa;
-      --accent-soft: #e5f1fa;
-      --good: #0f7b4f;
-      --good-soft: #e2f4ec;
-      --warn: #9a6700;
-      --warn-soft: #fff2cc;
-      --bad: #b42318;
-      --bad-soft: #fde7e4;
+      --surface-soft: #f7f8f5;
+      --line: #dce1dc;
+      --line-strong: #bdc7bf;
+      --ink: #18211d;
+      --muted: #68736d;
+      --muted-strong: #3e4a44;
+      --nav: #19211e;
+      --nav-soft: #26312c;
+      --accent: #087f6a;
+      --accent-soft: #e3f2ed;
+      --signal: #d7603f;
+      --signal-soft: #faebe6;
+      --good: #087f5b;
+      --good-soft: #e1f3eb;
+      --warn: #986500;
+      --warn-soft: #fff1c7;
+      --bad: #bd3d30;
+      --bad-soft: #fbe8e4;
       --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
       background: var(--bg);
       color: var(--ink);
@@ -4267,7 +4276,7 @@ DASHBOARD_TEMPLATE = """
     }
     .layout {
       display: grid;
-      grid-template-columns: 248px minmax(0, 1fr);
+      grid-template-columns: 220px minmax(0, 1fr);
       min-height: 100vh;
     }
     aside {
@@ -4276,21 +4285,21 @@ DASHBOARD_TEMPLATE = """
       height: 100vh;
       background: var(--nav);
       color: #eef5fb;
-      padding: 26px 20px;
+      padding: 24px 18px;
       border-right: 1px solid rgba(255,255,255,0.06);
     }
     .brand-mark {
       display: grid;
-      grid-template-columns: 42px 1fr;
-      gap: 12px;
+      grid-template-columns: 36px 1fr;
+      gap: 10px;
       align-items: center;
       margin-bottom: 28px;
     }
     .brand-square {
-      width: 42px;
-      height: 42px;
+      width: 36px;
+      height: 36px;
       border: 1px solid rgba(255,255,255,0.22);
-      background: #213141;
+      background: #25322d;
       display: grid;
       place-items: center;
       font-family: var(--mono);
@@ -4299,21 +4308,21 @@ DASHBOARD_TEMPLATE = """
       border-radius: 8px;
     }
     aside h1 {
-      font-size: 18px;
+      font-size: 16px;
       line-height: 1.35;
       margin: 0;
       text-wrap: balance;
     }
     .side-caption {
       margin: 4px 0 0;
-      color: #9eb2c4;
+      color: #9eb0a7;
       font-size: 12px;
       letter-spacing: 0.02em;
     }
     nav { display: grid; gap: 4px; }
     aside a {
       display: block;
-      color: #c8d6e2;
+      color: #c8d3cd;
       text-decoration: none;
       padding: 10px 12px;
       border-radius: 7px;
@@ -4327,12 +4336,12 @@ DASHBOARD_TEMPLATE = """
     }
     .side-note {
       position: absolute;
-      left: 20px;
-      right: 20px;
+      left: 18px;
+      right: 18px;
       bottom: 22px;
       padding-top: 14px;
       border-top: 1px solid rgba(255,255,255,0.12);
-      color: #9eb2c4;
+      color: #9eb0a7;
       font-size: 12px;
       line-height: 1.7;
     }
@@ -4340,7 +4349,7 @@ DASHBOARD_TEMPLATE = """
       min-width: 0;
       max-width: 100%;
       overflow-x: hidden;
-      padding: 22px 24px 36px;
+      padding: 24px 30px 42px;
     }
     .topbar {
       display: grid;
@@ -4668,36 +4677,416 @@ DASHBOARD_TEMPLATE = """
       section { padding: 13px; }
       th, td { padding: 8px 6px; }
     }
+
+    /* Monitor v3: information-dense operational workspace. */
+    main {
+      display: flex;
+      flex-direction: column;
+    }
+    .topbar { order: 1; }
+    .safety-strip { order: 2; }
+    #status { order: 3; }
+    #plots { order: 4; }
+    .workspace { order: 5; }
+    .topbar {
+      align-items: center;
+      margin-bottom: 12px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .page-title {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      min-width: 0;
+    }
+    .page-title h2 {
+      font-size: 22px;
+      white-space: nowrap;
+    }
+    .page-title p {
+      margin: 0;
+      padding-left: 14px;
+      border-left: 1px solid var(--line-strong);
+    }
+    .mode-badge,
+    .status-pill {
+      border-radius: 4px;
+      min-height: 28px;
+      padding: 4px 9px;
+      font-family: var(--mono);
+      letter-spacing: 0;
+    }
+    .safety-strip {
+      background: transparent;
+      border: 0;
+      border-left: 3px solid var(--warn);
+      border-radius: 0;
+      padding: 8px 0 8px 13px;
+      margin-bottom: 14px;
+    }
+    .safety-strip strong { font-size: 13px; }
+    .safety-strip span { color: var(--muted); }
+    .actions { flex-wrap: nowrap; }
+    button {
+      min-height: 34px;
+      border-radius: 4px;
+      padding: 7px 12px;
+      background: var(--accent);
+      border-color: #066856;
+      font-size: 13px;
+    }
+    button.secondary {
+      color: var(--muted-strong);
+      border-color: var(--line-strong);
+    }
+    button:focus-visible,
+    a:focus-visible {
+      outline: 2px solid var(--signal);
+      outline-offset: 2px;
+    }
+    section {
+      background: transparent;
+      border: 0;
+      border-top: 1px solid var(--line);
+      border-radius: 0;
+      padding: 20px 0 0;
+    }
+    section + section { margin-top: 20px; }
+    #status {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      padding: 0;
+      margin-bottom: 18px;
+    }
+    #status .section-head {
+      margin: 0;
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-soft);
+    }
+    #status .section-head h3 {
+      font-size: 13px;
+      text-transform: uppercase;
+      color: var(--muted-strong);
+    }
+    .kpi-strip {
+      grid-template-columns: repeat(8, minmax(112px, 1fr));
+      gap: 0;
+      margin: 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .kpi-strip::-webkit-scrollbar { display: none; }
+    .kpi-strip .metric {
+      min-width: 112px;
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-radius: 0;
+      padding: 13px 14px 12px;
+      background: var(--surface);
+    }
+    .kpi-strip .metric:last-child { border-right: 0; }
+    .kpi-strip .metric strong {
+      min-height: 24px;
+      margin-top: 5px;
+      font-size: 17px;
+    }
+    .kpi-strip .metric small {
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #plots {
+      padding-top: 0;
+      border-top: 0;
+      margin-bottom: 22px;
+    }
+    #plots .section-head {
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    #plots .section-head::after {
+      content: "";
+      height: 1px;
+      flex: 1 1 80px;
+      background: var(--line);
+      order: 2;
+    }
+    #plots .section-note { order: 3; }
+    h3 { font-size: 16px; }
+    .plots { gap: 10px; }
+    .plot-frame {
+      border-radius: 4px;
+      background: var(--surface);
+      border-color: var(--line-strong);
+      box-shadow: 0 1px 0 rgba(24, 33, 29, 0.04);
+    }
+    .plot-title {
+      padding: 9px 11px;
+      background: var(--surface-soft);
+      color: var(--muted-strong);
+    }
+    .plots img {
+      aspect-ratio: 2 / 1;
+      min-height: 0;
+      object-fit: contain;
+    }
+    .workspace {
+      grid-template-columns: minmax(320px, 0.82fr) minmax(520px, 1.35fr);
+      gap: 28px;
+    }
+    .metric-grid,
+    .strategy-grid,
+    .signal-summary {
+      gap: 0;
+      border: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .metric-grid .metric,
+    .strategy-grid .metric,
+    .signal-summary .metric {
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      background: var(--surface);
+      padding: 11px 12px;
+    }
+    .metric-grid .metric:nth-child(2n),
+    .strategy-grid .metric:nth-child(4n),
+    .signal-summary .metric:nth-child(4n) {
+      border-right: 0;
+    }
+    .metric-grid .metric:nth-last-child(-n+2),
+    .strategy-grid .metric:nth-last-child(-n+4),
+    .signal-summary .metric:nth-last-child(-n+4) {
+      border-bottom: 0;
+    }
+    .metric strong {
+      min-height: 22px;
+      margin-top: 4px;
+      font-size: 16px;
+    }
+    .metric strong[data-tone="positive"] { color: var(--good); }
+    .metric strong[data-tone="negative"] { color: var(--bad); }
+    .metric strong[data-tone="warning"] { color: var(--warn); }
+    .section-head {
+      margin-bottom: 10px;
+      align-items: center;
+    }
+    .section-note {
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .table-wrap {
+      border-radius: 4px;
+      background: var(--surface);
+      border-color: var(--line);
+      scrollbar-width: thin;
+    }
+    .table-wrap + .table-wrap { margin-top: 10px; }
+    th, td {
+      padding: 8px 9px;
+      line-height: 1.45;
+    }
+    th {
+      background: var(--surface-soft);
+      color: var(--muted-strong);
+    }
+    tbody tr:hover td { background: #f5faf7; }
+    .table-wrap thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .side-note strong { color: #e7efeb; }
+    .side-runtime {
+      display: grid;
+      gap: 5px;
+      margin-top: 8px;
+      font-family: var(--mono);
+      color: #c4d0ca;
+    }
+    .side-runtime span {
+      overflow-wrap: anywhere;
+    }
+    .refresh-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .refresh-state::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--good);
+      box-shadow: 0 0 0 3px var(--good-soft);
+    }
+    .refresh-state.offline::before {
+      background: var(--bad);
+      box-shadow: 0 0 0 3px var(--bad-soft);
+    }
+    .empty-row td {
+      color: var(--muted);
+      text-align: center;
+      font-family: inherit;
+      padding: 18px;
+    }
+    @media (max-width: 1280px) {
+      .kpi-strip { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
+      .workspace { grid-template-columns: 1fr; gap: 0; }
+      .plots { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 860px) {
+      aside {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        padding: 10px 14px 0;
+        border-right: 0;
+        border-bottom: 1px solid rgba(255,255,255,0.12);
+      }
+      .brand-mark {
+        margin-bottom: 8px;
+        grid-template-columns: 30px minmax(0, 1fr);
+      }
+      .brand-square { width: 30px; height: 30px; font-size: 11px; }
+      aside h1 { font-size: 14px; }
+      .side-caption,
+      .side-note { display: none; }
+      nav {
+        display: flex;
+        gap: 0;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+      nav::-webkit-scrollbar { display: none; }
+      aside a {
+        flex: 0 0 auto;
+        padding: 8px 11px 10px;
+        border-radius: 0;
+        font-size: 12px;
+      }
+      main { padding: 16px 14px 32px; }
+      .topbar {
+        grid-template-columns: 1fr;
+        align-items: start;
+      }
+      .page-title {
+        display: block;
+      }
+      .page-title h2 { white-space: normal; }
+      .page-title p {
+        border-left: 0;
+        padding-left: 0;
+        margin-top: 4px;
+      }
+      .mode-stack { justify-content: flex-start; }
+      .mode-badge {
+        width: auto;
+        white-space: nowrap;
+      }
+      .safety-strip {
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+      .plots { grid-template-columns: 1fr; }
+      .kpi-strip { grid-template-columns: repeat(4, minmax(132px, 1fr)); }
+    }
+    @media (max-width: 560px) {
+      .topbar { padding-bottom: 12px; }
+      .page-title h2 { font-size: 20px; }
+      .page-title p { font-size: 12px; }
+      .mode-stack {
+        display: flex;
+        overflow: visible;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        gap: 5px;
+        padding-bottom: 0;
+      }
+      .mode-badge {
+        width: auto;
+        flex: 0 0 auto;
+        padding-inline: 6px;
+        font-size: 10px;
+      }
+      .safety-strip {
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+      .safety-strip strong,
+      .safety-strip span { word-break: normal; }
+      .actions { justify-content: flex-start; }
+      #status { margin-inline: -14px; border-inline: 0; }
+      #status .section-head { padding-inline: 14px; }
+      .kpi-strip {
+        display: flex;
+        scroll-snap-type: x proximity;
+      }
+      .kpi-strip .metric {
+        flex: 0 0 148px;
+        scroll-snap-align: start;
+      }
+      .metric-grid,
+      .strategy-grid,
+      .signal-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .strategy-grid .metric:nth-child(4n),
+      .signal-summary .metric:nth-child(4n) { border-right: 1px solid var(--line); }
+      .strategy-grid .metric:nth-child(2n),
+      .signal-summary .metric:nth-child(2n) { border-right: 0; }
+      .strategy-grid .metric:nth-last-child(-n+4),
+      .signal-summary .metric:nth-last-child(-n+4) { border-bottom: 1px solid var(--line); }
+      .strategy-grid .metric:nth-last-child(-n+2),
+      .signal-summary .metric:nth-last-child(-n+2) { border-bottom: 0; }
+      .signal-summary .metric strong[data-testid="rejection-reason"] {
+        max-height: 48px;
+      }
+      .plots img { aspect-ratio: 1.7 / 1; }
+      .section-head { align-items: flex-start; }
+      th, td { white-space: nowrap; }
+      #latest-signal-body th,
+      #latest-signal-body td { white-space: normal; min-width: 116px; }
+    }
   </style>
 </head>
-<body>
+<body data-ui-version="monitor-v3">
   <div class="layout">
     <aside>
       <div class="brand-mark">
         <div class="brand-square">ZS</div>
         <div>
-          <h1>币安U本位合约监控</h1>
-          <p class="side-caption">Z-score 影子验证台</p>
+          <h1>量化策略监控</h1>
+          <p class="side-caption">SOLUSDT / SHADOW</p>
         </div>
       </div>
       <nav>
-        <a href="#status">运行总览</a>
-        <a href="#account">账户与行情</a>
-        <a href="#strategy">策略验证</a>
-        <a href="#signal">信号筛选</a>
-        <a href="#trades">影子交易</a>
-        <a href="#plots">实时图表</a>
+        <a href="#status">总览</a>
+        <a href="#plots">图表</a>
+        <a href="#signal">信号</a>
+        <a href="#strategy">策略</a>
+        <a href="#market-gate">市场门控</a>
+        <a href="#trades">交易记录</a>
       </nav>
       <div class="side-note">
         <strong>安全边界</strong><br>
         仅监控与影子验证，不执行真实订单。
+        <div class="side-runtime">
+          <span class="refresh-state" data-testid="refresh-state">实时连接</span>
+          <span>更新 <span data-testid="last-update">{{ snapshot.last_update }}</span></span>
+          <span>启动 <span data-testid="started-at">{{ snapshot.started_at }}</span></span>
+        </div>
       </div>
     </aside>
     <main>
       <div class="topbar">
         <div class="page-title">
-          <h2>交易策略影子监控台</h2>
-          <p>自动刷新运行状态、策略信号、虚拟交易与图表。</p>
+          <h2><span data-testid="header-symbol">{{ snapshot.config.symbol }}</span> 策略监控</h2>
+          <p>已收盘 1 分钟 K 线 · 4 秒局部刷新 · UTC 时间</p>
         </div>
         <div class="mode-stack">
           <span class="mode-badge safe">SHADOW MODE</span>
@@ -4708,29 +5097,29 @@ DASHBOARD_TEMPLATE = """
 
       <div class="safety-strip" data-testid="safety-strip">
         <div>
-          <strong>安全状态：当前为影子验证模式，不会真实下单。</strong>
-          <span>真实下单通道保持关闭，影子验证持续运行。</span>
+          <strong>影子验证模式：真实下单通道已锁定</strong>
+          <span>这里只记录信号与虚拟成交，不会改变 Binance 账户状态。</span>
         </div>
         <div class="actions">
-          <form method="post" action="/pause"><button class="secondary" type="submit">暂停</button></form>
-          <form method="post" action="/resume"><button type="submit">继续运行</button></form>
+          <form class="command-form" method="post" action="/pause"><button class="secondary" type="submit" title="暂停影子策略循环">Ⅱ&nbsp; 暂停</button></form>
+          <form class="command-form" method="post" action="/resume"><button type="submit" title="继续影子策略循环">▶&nbsp; 继续</button></form>
         </div>
       </div>
 
       <section id="status">
         <div class="section-head">
-          <h3>运行总览</h3>
-          <span class="section-note">每 4 秒刷新一次</span>
+          <h3>运行仪表</h3>
+          <span class="section-note"><span class="refresh-state">LIVE</span> / 4 SEC</span>
         </div>
         <div class="kpi-strip">
           <div class="metric compact"><span>运行状态</span><strong><span class="status-pill {{ snapshot.status }}" data-testid="status">{{ snapshot.status }}</span></strong><small>暂停后仍可查看已有数据</small></div>
           <div class="metric compact"><span>交易对</span><strong data-testid="symbol">{{ snapshot.config.symbol }}</strong><small>当前监控标的</small></div>
-          <div class="metric compact"><span>USDT 余额</span><strong data-testid="balance">{{ "%.6f"|format(snapshot.balance) if snapshot.balance is number else snapshot.balance }}</strong><small>只读余额展示</small></div>
-          <div class="metric compact"><span>最新 Z-score</span><strong data-testid="latest-zscore">{{ "%.8f"|format(snapshot.latest_zscore) if snapshot.latest_zscore is number else snapshot.latest_zscore }}</strong><small>基于已收盘 1m K 线</small></div>
+          <div class="metric compact"><span>USDT 余额</span><strong data-testid="balance" data-format="money">{{ "%.6f"|format(snapshot.balance) if snapshot.balance is number else snapshot.balance }}</strong><small>只读余额展示</small></div>
+          <div class="metric compact"><span>最新 Z-score</span><strong data-testid="latest-zscore" data-format="score">{{ "%.8f"|format(snapshot.latest_zscore) if snapshot.latest_zscore is number else snapshot.latest_zscore }}</strong><small>基于已收盘 1m K 线</small></div>
           <div class="metric compact"><span>虚拟持仓</span><strong data-testid="elite-open-position">{{ snapshot.shadow.open_position_count }}</strong><small>router shadow position</small></div>
-          <div class="metric compact"><span>执行控制器</span><strong data-testid="active-execution-strategy">{{ snapshot.shadow.active_execution_strategy }}</strong><small>唯一成交入口</small></div>
+          <div class="metric compact"><span>执行控制器</span><strong data-testid="active-execution-strategy" title="{{ snapshot.shadow.active_execution_strategy }}">{{ snapshot.shadow.active_execution_strategy }}</strong><small>唯一成交入口</small></div>
           <div class="metric compact"><span>市场状态</span><strong data-testid="current-regime">{{ snapshot.shadow.current_regime }}</strong><small>regime classifier</small></div>
-          <div class="metric compact"><span>路由策略</span><strong data-testid="router-active-strategy">{{ snapshot.shadow.router_active_strategy }}</strong><small>每根 K 线最多一个</small></div>
+          <div class="metric compact"><span>路由策略</span><strong data-testid="router-active-strategy" title="{{ snapshot.shadow.router_active_strategy }}">{{ snapshot.shadow.router_active_strategy }}</strong><small>每根 K 线最多一个</small></div>
         </div>
       </section>
 
@@ -4742,32 +5131,32 @@ DASHBOARD_TEMPLATE = """
               <span class="section-note" data-testid="latest-candle">{{ snapshot.latest_closed_candle_time }}</span>
             </div>
             <div class="metric-grid">
-              <div class="metric"><span>是否暂停</span><strong data-testid="paused">{{ snapshot.paused }}</strong></div>
-              <div class="metric"><span>影子模式</span><strong data-testid="shadow-mode">{{ snapshot.config.shadow_mode }}</strong></div>
+              <div class="metric"><span>是否暂停</span><strong data-testid="paused" data-format="bool">{{ snapshot.paused }}</strong></div>
+              <div class="metric"><span>影子模式</span><strong data-testid="shadow-mode" data-format="bool">{{ snapshot.config.shadow_mode }}</strong></div>
               <div class="metric"><span>杠杆</span><strong data-testid="leverage">{{ snapshot.leverage }}x</strong></div>
               <div class="metric"><span>保证金模式</span><strong data-testid="margin-type">{{ snapshot.margin_type }}</strong></div>
-              <div class="metric"><span>最新收盘价</span><strong data-testid="latest-close">{{ "%.4f"|format(snapshot.latest_close) if snapshot.latest_close is number else snapshot.latest_close }}</strong></div>
+              <div class="metric"><span>最新收盘价</span><strong data-testid="latest-close" data-format="price">{{ "%.4f"|format(snapshot.latest_close) if snapshot.latest_close is number else snapshot.latest_close }}</strong></div>
               <div class="metric"><span>候选信号数</span><strong data-testid="candidate-signals">{{ snapshot.shadow.candidate_signals }}</strong></div>
-              <div class="metric"><span>ATR 桶</span><strong data-testid="atr-bucket">{{ snapshot.atr_bucket }}</strong><small data-testid="atr-pct">{{ "%.8f"|format(snapshot.atr_pct) if snapshot.atr_pct is number else snapshot.atr_pct }}</small></div>
-              <div class="metric"><span>趋势桶</span><strong data-testid="trend-bucket">{{ snapshot.trend_bucket }}</strong><small data-testid="trend-slope">{{ "%.8f"|format(snapshot.trend_slope_pct) if snapshot.trend_slope_pct is number else snapshot.trend_slope_pct }}</small></div>
+              <div class="metric"><span>ATR 桶</span><strong data-testid="atr-bucket">{{ snapshot.atr_bucket }}</strong><small data-testid="atr-pct" data-format="percent">{{ "%.8f"|format(snapshot.atr_pct) if snapshot.atr_pct is number else snapshot.atr_pct }}</small></div>
+              <div class="metric"><span>趋势桶</span><strong data-testid="trend-bucket">{{ snapshot.trend_bucket }}</strong><small data-testid="trend-slope" data-format="percent">{{ "%.8f"|format(snapshot.trend_slope_pct) if snapshot.trend_slope_pct is number else snapshot.trend_slope_pct }}</small></div>
             </div>
           </section>
 
           <section id="strategy">
             <div class="section-head">
               <h3>策略验证</h3>
-              <span class="section-note">REGIME_STRATEGY_ROUTER</span>
+              <span class="section-note">REGIME STRATEGY ROUTER</span>
             </div>
             <div class="strategy-grid">
-              <div class="metric"><span>净收益</span><strong data-testid="elite-net-pnl">{{ snapshot.shadow.net_pnl_usdt }}</strong></div>
-              <div class="metric"><span>胜率</span><strong data-testid="elite-win-rate">{{ snapshot.shadow.win_rate }}</strong></div>
-              <div class="metric"><span>单笔期望</span><strong data-testid="elite-expectancy">{{ snapshot.shadow.expectancy_usdt }}</strong></div>
-              <div class="metric"><span>利润因子</span><strong data-testid="elite-profit-factor">{{ snapshot.shadow.profit_factor }}</strong></div>
-              <div class="metric"><span>最大回撤</span><strong data-testid="elite-drawdown">{{ snapshot.shadow.max_drawdown_usdt }}</strong></div>
+              <div class="metric"><span>净收益</span><strong data-testid="elite-net-pnl" data-format="money" data-tone-source="signed">{{ snapshot.shadow.net_pnl_usdt }}</strong></div>
+              <div class="metric"><span>胜率</span><strong data-testid="elite-win-rate" data-format="rate">{{ snapshot.shadow.win_rate }}</strong></div>
+              <div class="metric"><span>单笔期望</span><strong data-testid="elite-expectancy" data-format="money" data-tone-source="signed">{{ snapshot.shadow.expectancy_usdt }}</strong></div>
+              <div class="metric"><span>利润因子</span><strong data-testid="elite-profit-factor" data-format="ratio">{{ snapshot.shadow.profit_factor }}</strong></div>
+              <div class="metric"><span>最大回撤</span><strong data-testid="elite-drawdown" data-format="money">{{ snapshot.shadow.max_drawdown_usdt }}</strong></div>
               <div class="metric"><span>完成交易</span><strong data-testid="elite-total-trades">{{ snapshot.shadow.completed_trades }}</strong></div>
               <div class="metric"><span>可行性</span><strong data-testid="elite-viability">{{ snapshot.shadow.viability_status }}</strong></div>
               <div class="metric"><span>最近错误</span><strong data-testid="last-error">{{ snapshot.last_error }}</strong></div>
-              <div class="metric"><span>数据集有效</span><strong data-testid="dataset-valid">{{ snapshot.shadow.dataset_valid }}</strong><small data-testid="contaminated-count">{{ snapshot.shadow.contaminated_trade_count }}</small></div>
+              <div class="metric"><span>数据集有效</span><strong data-testid="dataset-valid" data-format="bool">{{ snapshot.shadow.dataset_valid }}</strong><small>污染记录 <span data-testid="contaminated-count">{{ snapshot.shadow.contaminated_trade_count }}</span></small></div>
               <div class="metric"><span>最佳组合</span><strong data-testid="best-regime-strategy-pair">{{ snapshot.shadow.best_regime_strategy_pair }}</strong></div>
               <div class="metric"><span>最差组合</span><strong data-testid="worst-regime-strategy-pair">{{ snapshot.shadow.worst_regime_strategy_pair }}</strong></div>
             </div>
@@ -4775,23 +5164,23 @@ DASHBOARD_TEMPLATE = """
 
           <section id="market-gate">
             <div class="section-head">
-              <h3>Market Gate Analytics</h3>
-              <span class="section-note">Observation only unless MARKET_GATE_ENFORCED=true</span>
+              <h3>市场状态与时间窗口</h3>
+              <span class="section-note">OBSERVATION / MARKET GATE</span>
             </div>
             <div class="strategy-grid">
-              <div class="metric"><span>Stability</span><strong data-testid="current-stability-state">{{ snapshot.shadow.current_stability_state }}</strong></div>
-              <div class="metric"><span>Score</span><strong data-testid="current-regime-stability-score">{{ snapshot.shadow.current_regime_stability_score }}</strong></div>
-              <div class="metric"><span>Time Window</span><strong data-testid="current-time-window-id">{{ snapshot.shadow.current_time_window_id }}</strong></div>
-              <div class="metric"><span>Gate Allowed</span><strong data-testid="current-gate-allowed">{{ snapshot.shadow.current_trade_allowed_by_market_gate }}</strong></div>
-              <div class="metric"><span>Gate Enforced</span><strong data-testid="market-gate-enforced">{{ snapshot.shadow.market_gate_enforced }}</strong></div>
-              <div class="metric"><span>Gate Reason</span><strong data-testid="current-market-gate-rejection">{{ snapshot.shadow.current_market_gate_rejection_reason }}</strong></div>
-              <div class="metric"><span>Window Trades</span><strong data-testid="current-window-trades">{{ snapshot.shadow.latest_signal.get("window_trade_count", "") }}</strong></div>
-              <div class="metric"><span>Window Expectancy</span><strong data-testid="current-window-expectancy">{{ snapshot.shadow.latest_signal.get("window_expectancy", "") }}</strong></div>
-              <div class="metric"><span>Window Profit Factor</span><strong data-testid="current-window-profit-factor">{{ snapshot.shadow.latest_signal.get("window_profit_factor", "") }}</strong></div>
+              <div class="metric"><span>稳定状态</span><strong data-testid="current-stability-state">{{ snapshot.shadow.current_stability_state }}</strong></div>
+              <div class="metric"><span>稳定评分</span><strong data-testid="current-regime-stability-score" data-format="score">{{ snapshot.shadow.current_regime_stability_score }}</strong></div>
+              <div class="metric"><span>UTC 窗口</span><strong data-testid="current-time-window-id">{{ snapshot.shadow.current_time_window_id }}</strong></div>
+              <div class="metric"><span>门控允许</span><strong data-testid="current-gate-allowed" data-format="bool">{{ snapshot.shadow.current_trade_allowed_by_market_gate }}</strong></div>
+              <div class="metric"><span>门控生效</span><strong data-testid="market-gate-enforced" data-format="bool">{{ snapshot.shadow.market_gate_enforced }}</strong></div>
+              <div class="metric"><span>门控原因</span><strong data-testid="current-market-gate-rejection">{{ snapshot.shadow.current_market_gate_rejection_reason }}</strong></div>
+              <div class="metric"><span>窗口交易</span><strong data-testid="current-window-trades">{{ snapshot.shadow.latest_signal.get("window_trade_count", "") }}</strong></div>
+              <div class="metric"><span>窗口期望</span><strong data-testid="current-window-expectancy" data-format="money">{{ snapshot.shadow.latest_signal.get("window_expectancy", "") }}</strong></div>
+              <div class="metric"><span>窗口利润因子</span><strong data-testid="current-window-profit-factor" data-format="ratio">{{ snapshot.shadow.latest_signal.get("window_profit_factor", "") }}</strong></div>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Window</th><th>Trades</th><th>Expectancy</th><th>Profit Factor</th><th>Net PnL</th><th>Win Rate</th></tr></thead>
+                <thead><tr><th>可盈利窗口</th><th>交易</th><th>期望</th><th>利润因子</th><th>净收益</th><th>胜率</th></tr></thead>
                 <tbody id="profitable-windows-body">
                 {% for row in snapshot.shadow.profitable_windows %}
                   <tr><td>{{ row.time_window_id }}</td><td>{{ row.trades }}</td><td>{{ row.expectancy }}</td><td>{{ row.profit_factor }}</td><td>{{ row.net_pnl }}</td><td>{{ row.win_rate }}</td></tr>
@@ -4801,7 +5190,7 @@ DASHBOARD_TEMPLATE = """
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Worst Window</th><th>Trades</th><th>Expectancy</th><th>Profit Factor</th><th>Net PnL</th><th>Win Rate</th></tr></thead>
+                <thead><tr><th>较差窗口</th><th>交易</th><th>期望</th><th>利润因子</th><th>净收益</th><th>胜率</th></tr></thead>
                 <tbody id="worst-windows-body">
                 {% for row in snapshot.shadow.worst_windows %}
                   <tr><td>{{ row.time_window_id }}</td><td>{{ row.trades }}</td><td>{{ row.expectancy }}</td><td>{{ row.profit_factor }}</td><td>{{ row.net_pnl }}</td><td>{{ row.win_rate }}</td></tr>
@@ -4885,14 +5274,39 @@ DASHBOARD_TEMPLATE = """
     </main>
   </div>
   <script>
-    function fmt(value) {
-      if (value === null || value === undefined || value === "") return "";
-      if (typeof value === "number") return Number.isFinite(value) ? value.toFixed(8) : String(value);
+    function formatNumber(value, digits) {
+      if (!Number.isFinite(value)) return String(value);
+      return value.toFixed(digits).replace(/0+$/, "").replace(/\\.$/, "");
+    }
+    function fmt(value, format) {
+      if (value === null || value === undefined || value === "") return "—";
+      if (format === "bool") {
+        if (value === true || String(value).toLowerCase() === "true") return "是";
+        if (value === false || String(value).toLowerCase() === "false") return "否";
+      }
+      if (typeof value === "number") {
+        if (format === "money") return formatNumber(value, 6) + " USDT";
+        if (format === "price") return formatNumber(value, 4);
+        if (format === "score") return formatNumber(value, 3);
+        if (format === "ratio") return formatNumber(value, 3);
+        if (format === "percent") return formatNumber(value * 100, 3) + "%";
+        if (format === "rate") return formatNumber(value * 100, 2) + "%";
+        return formatNumber(value, 6);
+      }
       return String(value);
+    }
+    function applyTone(node, value) {
+      if (!node || node.dataset.toneSource !== "signed") return;
+      const number = Number(value);
+      node.dataset.tone = !Number.isFinite(number) || number === 0
+        ? ""
+        : (number > 0 ? "positive" : "negative");
     }
     function setText(selector, value) {
       const node = document.querySelector(selector);
-      if (node) node.textContent = fmt(value);
+      if (!node) return;
+      node.textContent = fmt(value, node.dataset.format || "");
+      applyTone(node, value);
     }
     function setStatusClass(value) {
       const node = document.querySelector('[data-testid="status"]');
@@ -4901,16 +5315,22 @@ DASHBOARD_TEMPLATE = """
       if (value) node.classList.add(String(value));
     }
     function escapeHtml(value) {
-      return fmt(value).replace(/[&<>"']/g, (char) => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;"
+      return fmt(value, "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
       }[char]));
     }
     async function refreshDashboard() {
+      const refreshState = document.querySelector('[data-testid="refresh-state"]');
+      try {
       const response = await fetch("/api/status", {cache: "no-store"});
-      if (!response.ok) return;
+      if (!response.ok) throw new Error("Status request failed");
       const snapshot = await response.json();
       const shadow = snapshot.shadow || {};
       const config = snapshot.config || {};
+      if (refreshState) {
+        refreshState.textContent = "实时连接";
+        refreshState.classList.remove("offline");
+      }
       setText('[data-testid="status"]', snapshot.status);
       setStatusClass(snapshot.status);
       setText('[data-testid="paused"]', snapshot.paused);
@@ -4921,6 +5341,7 @@ DASHBOARD_TEMPLATE = """
       setText('[data-testid="last-update"]', snapshot.last_update);
       setText('[data-testid="balance"]', snapshot.balance);
       setText('[data-testid="symbol"]', config.symbol);
+      setText('[data-testid="header-symbol"]', config.symbol);
       setText('[data-testid="last-error"]', snapshot.last_error);
       setText('[data-testid="leverage"]', `${snapshot.leverage || ""}x`);
       setText('[data-testid="margin-type"]', snapshot.margin_type);
@@ -5001,8 +5422,30 @@ DASHBOARD_TEMPLATE = """
       const cPlot = document.getElementById("closes-plot");
       if (zPlot) zPlot.src = `/plot/zscore.png?t=${stamp}`;
       if (cPlot) cPlot.src = `/plot/closes.png?t=${stamp}`;
+      } catch (error) {
+        if (refreshState) {
+          refreshState.textContent = "连接异常";
+          refreshState.classList.add("offline");
+        }
+      }
+    }
+    async function submitCommand(form) {
+      const button = form.querySelector("button");
+      if (button) button.disabled = true;
+      try {
+        await fetch(form.action, {method: "POST", cache: "no-store"});
+        await refreshDashboard();
+      } finally {
+        if (button) button.disabled = false;
+      }
     }
     window.addEventListener("load", () => {
+      document.querySelectorAll(".command-form").forEach((form) => {
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          submitCommand(form).catch(() => {});
+        });
+      });
       refreshDashboard().catch(() => {});
       window.setInterval(() => refreshDashboard().catch(() => {}), 4000);
     });

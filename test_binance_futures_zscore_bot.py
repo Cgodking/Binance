@@ -143,19 +143,37 @@ class EliteStrategyConfigTests(EnvTestCase):
         text = Path("binance_futures_zscore_bot.py").read_text(encoding="utf-8")
 
         self.assertIn("币安U本位合约监控", text)
-        self.assertIn("交易策略影子监控台", text)
-        self.assertIn("安全状态", text)
+        self.assertIn('data-ui-version="monitor-v3"', text)
+        self.assertIn("策略监控", text)
+        self.assertIn("真实下单通道已锁定", text)
         self.assertIn("策略验证", text)
         self.assertIn("信号筛选", text)
         self.assertIn("实时图表", text)
         self.assertIn("kpi-strip", text)
         self.assertIn("mode-badge", text)
+        self.assertIn("command-form", text)
+        self.assertIn("refreshDashboard", text)
+        self.assertIn("formatNumber", text)
         self.assertIn("data-testid=\"candidate-signals\"", text)
         self.assertIn("SHADOW MODE", text)
         self.assertNotIn("Elite Shadow Strategy Monitor", text)
         self.assertNotIn("seaborn", text.lower())
         self.assertIn("debug=False", text)
         self.assertIn("use_reloader=False", text)
+
+    def test_dashboard_render_keeps_javascript_quote_escape_valid(self):
+        module = reload_bot()
+        state = module.RuntimeState(persist_events=False)
+        config = module.Config(web_auth_enabled=False)
+        state.update_config(config)
+        app = module.create_flask_app(state, config=config)
+
+        response = app.test_client().get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("'\"': \"&quot;\"", html)
+        self.assertNotIn('""": "&quot;"', html)
 
 
 class EliteSignalDecisionTests(EnvTestCase):

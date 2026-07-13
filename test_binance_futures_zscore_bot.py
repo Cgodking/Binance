@@ -39,6 +39,11 @@ class EnvTestCase(unittest.TestCase):
                 "LEVERAGE",
                 "MAX_MARGIN_USDT",
                 "MAX_NOTIONAL_USDT",
+                "MAX_NET_LOSS_PER_TRADE_USDT",
+                "MAX_RISK_PER_TRADE_PCT",
+                "MAX_ACCOUNT_MARGIN_FRACTION",
+                "GAP_RISK_BUFFER_PCT",
+                "SHADOW_SPREAD_BPS",
                 "LOOP_SLEEP_SECONDS",
                 "SHADOW_STATE_FILE",
                 "SHADOW_SIGNAL_LOG_FILE",
@@ -267,6 +272,59 @@ class EliteSignalDecisionTests(EnvTestCase):
                 self.assertEqual(decision.trade_decision, "REJECT")
                 self.assertEqual(decision.failed_filter, case["failed"])
                 self.assertTrue(decision.rejection_reason)
+
+
+class RiskSizingTests(EnvTestCase):
+    def setUp(self):
+        super().setUp()
+        self.module = reload_bot()
+        self.config = self.module.load_config()
+        self.filters = self.module.ExchangeFilters(
+            step_size=0.001,
+            tick_size=0.01,
+            min_qty=0.001,
+            max_qty=1000.0,
+            min_notional=5.0,
+            quantity_precision=3,
+            price_precision=2,
+        )
+
+    def test_minimum_order_is_rejected_instead_of_increasing_risk(self):
+        plan = self.module.build_risk_sizing_plan(
+            balance=1.5,
+            price=100.0,
+            filters=self.filters,
+            config=self.config,
+        )
+
+        self.assertEqual(plan.quantity, 0.0)
+        self.assertEqual(plan.skip_reason, "MINIMUM_ORDER_EXCEEDS_RISK_BUDGET")
+        self.assertGreater(plan.minimum_order_estimated_loss_usdt, plan.risk_budget_usdt)
+        self.assertEqual(
+            self.module.calculate_order_quantity(1.5, 100.0, self.filters, self.config),
+            0.0,
+        )
+
+    def test_risk_sized_quantity_stays_within_net_loss_budget(self):
+        config = self.module.replace(
+            self.config,
+            max_net_loss_per_trade_usdt=0.05,
+            max_risk_per_trade_pct=0.02,
+            max_margin_usdt=10.0,
+            max_notional_usdt=100.0,
+        )
+
+        plan = self.module.build_risk_sizing_plan(
+            balance=100.0,
+            price=100.0,
+            filters=self.filters,
+            config=config,
+        )
+
+        self.assertGreater(plan.quantity, 0.0)
+        self.assertGreaterEqual(plan.target_notional, self.filters.min_notional)
+        self.assertLessEqual(plan.estimated_net_loss_usdt, plan.risk_budget_usdt)
+        self.assertEqual(plan.skip_reason, "")
 
 
 class RegimeRouterTests(EnvTestCase):
@@ -619,7 +677,13 @@ class EliteShadowRuntimeTests(EnvTestCase):
         os.environ["SHADOW_TRADE_LOG_FILE"] = str(Path(self.temp_dir.name) / "shadow_trades.jsonl")
         os.environ["DECISION_REPORT_EVERY_COMPLETED_TRADES"] = "1"
         self.module = reload_bot()
-        self.config = self.module.load_config()
+        self.config = self.module.replace(
+            self.module.load_config(),
+            max_net_loss_per_trade_usdt=0.10,
+            max_risk_per_trade_pct=0.10,
+            max_margin_usdt=10.0,
+            max_notional_usdt=10.0,
+        )
         self.filters = self.module.ExchangeFilters(
             step_size=0.01,
             tick_size=0.01,
@@ -632,6 +696,7 @@ class EliteShadowRuntimeTests(EnvTestCase):
 
     def test_signal_logging_writes_jsonl_and_csv_for_every_evaluation(self):
         state = self.module.RuntimeState()
+        state.balance = 100.0
         decision = self.module.evaluate_elite_signal(
             self.config,
             timestamp="2026-06-14 00:00 UTC",
@@ -667,6 +732,7 @@ class EliteShadowRuntimeTests(EnvTestCase):
 
     def test_market_gate_annotations_are_logged_without_blocking_when_not_enforced(self):
         state = self.module.RuntimeState()
+        state.balance = 100.0
         regime = self.module.MarketRegimeSnapshot(
             timestamp="2026-07-02 10:34 UTC",
             regime="MEAN_REVERTING",
@@ -799,8 +865,15 @@ class EliteShadowRuntimeTests(EnvTestCase):
     def test_single_virtual_position_and_no_short_positions(self):
         os.environ["SHADOW_PROBE_ENABLED"] = "false"
         self.module = reload_bot()
-        self.config = self.module.load_config()
+        self.config = self.module.replace(
+            self.module.load_config(),
+            max_net_loss_per_trade_usdt=0.10,
+            max_risk_per_trade_pct=0.10,
+            max_margin_usdt=10.0,
+            max_notional_usdt=10.0,
+        )
         state = self.module.RuntimeState()
+        state.balance = 100.0
         short_decision = self.module.evaluate_elite_signal(
             self.config,
             timestamp="2026-06-14 00:00 UTC",
@@ -1017,8 +1090,15 @@ class EliteShadowRuntimeTests(EnvTestCase):
     def test_closing_trade_updates_metrics_and_writes_latest_report(self):
         os.environ["SHADOW_PROBE_ENABLED"] = "false"
         self.module = reload_bot()
-        self.config = self.module.load_config()
+        self.config = self.module.replace(
+            self.module.load_config(),
+            max_net_loss_per_trade_usdt=0.10,
+            max_risk_per_trade_pct=0.10,
+            max_margin_usdt=10.0,
+            max_notional_usdt=10.0,
+        )
         state = self.module.RuntimeState()
+        state.balance = 100.0
         enter = self.module.evaluate_elite_signal(
             self.config,
             timestamp="2026-06-14 00:00 UTC",
@@ -1526,8 +1606,288 @@ class CostAwareCandidateReplayTests(EnvTestCase):
     def test_candidate_cost_gate_matches_fee_and_slippage_assumptions(self):
         ratio = self.module.candidate_estimated_tp_cost_ratio(self.config, self.params)
 
-        self.assertAlmostEqual(ratio, 0.14)
+        self.assertAlmostEqual(ratio, 0.16)
         self.assertLess(ratio, self.params.maximum_tp_cost_ratio)
+
+    def test_rolling_walk_forward_uses_six_recent_windows_and_embargo(self):
+        day_ms = 24 * 60 * 60 * 1000
+        end_ms = 1000 * day_ms
+
+        windows = self.module.rolling_walk_forward_boundaries(600, end_ms, self.params)
+
+        self.assertEqual(len(windows), 6)
+        self.assertEqual(windows[-1]["test"][1], end_ms)
+        embargo_ms = self.params.embargo_minutes * 60 * 1000
+        for window in windows:
+            self.assertEqual(window["validation"][0] - window["train"][1], embargo_ms)
+            self.assertEqual(window["test"][0] - window["validation"][1], embargo_ms)
+        for previous, current in zip(windows, windows[1:]):
+            self.assertEqual(previous["test"][1], current["test"][0])
+
+    def test_gap_through_stop_exits_at_open_not_ideal_stop_price(self):
+        current, previous = self._signal_rows(2.0)
+        entry = dict(current)
+        entry.update(
+            {
+                "open_time": 120000,
+                "close_time": 179999,
+                "open": 102.0,
+                "high": 102.2,
+                "low": 101.8,
+                "close": 102.0,
+                "trend_feature_close_time": 179999,
+            }
+        )
+        gap = dict(entry)
+        gap.update(
+            {
+                "open_time": 180000,
+                "close_time": 239999,
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.5,
+                "close": 100.2,
+                "trend_feature_close_time": 239999,
+            }
+        )
+        frame = self.module.pd.DataFrame([previous, current, entry, gap])
+
+        result = self.module.candidate_replay_direction(
+            self.config,
+            self.filters,
+            frame,
+            0,
+            240000,
+            "LONG",
+            self.params,
+        )
+
+        trade = result["trades"][0]
+        self.assertEqual(trade["exit_reason"], "STOP_LOSS_GAP")
+        self.assertEqual(trade["exit_price"], 100.0)
+        self.assertTrue(trade["gap_exit"])
+        self.assertLess(trade["net_pnl"], -0.1)
+
+    def test_risk_overlay_rejects_exchange_minimum_above_budget(self):
+        source_trade = {
+            "strategy_id": self.module.CANDIDATE_TREND_LONG_NAME,
+            "entry_price": 65.0,
+            "exit_price": 65.5,
+            "quantity": 0.154,
+            "entry_notional": 10.01,
+            "exit_notional": 10.087,
+            "gross_pnl": 0.077,
+            "fees": 0.01,
+            "slippage": 0.004,
+            "spread_cost": 0.002,
+            "funding_pnl": 0.0,
+            "execution_cost": 0.016,
+            "net_pnl": 0.061,
+            "mfe_usdt": 0.1,
+            "mae_usdt": 0.02,
+        }
+
+        result = self.module.apply_risk_sizing_overlay(
+            [source_trade],
+            self.filters,
+            self.config,
+            self.params,
+            self.module.CANDIDATE_TREND_LONG_NAME,
+        )
+
+        self.assertEqual(result["report"]["trades"], 0)
+        self.assertEqual(
+            result["report"]["skip_reasons"],
+            {"MINIMUM_ORDER_EXCEEDS_RISK_BUDGET": 1},
+        )
+
+    def test_cost_stress_and_block_bootstrap_are_fee_aware(self):
+        trades = [
+            {
+                "gross_pnl": 0.10,
+                "fees": 0.01,
+                "slippage": 0.005,
+                "spread_cost": 0.005,
+                "funding_pnl": 0.0,
+                "net_pnl": 0.08,
+            }
+            for _ in range(20)
+        ]
+
+        stress = self.module.build_cost_stress_report(trades, (1.0, 1.5, 2.0))
+        bootstrap = self.module.block_bootstrap_expectancy(trades, 200, 4)
+
+        self.assertAlmostEqual(stress["1x"]["expectancy"], 0.08)
+        self.assertAlmostEqual(stress["1.5x"]["expectancy"], 0.07)
+        self.assertAlmostEqual(stress["2x"]["expectancy"], 0.06)
+        self.assertGreater(bootstrap["lower_95"], 0.0)
+
+    def test_mean_reversion_ledger_uses_current_router_rules(self):
+        previous = {
+            "candidate_zscore": -2.6,
+            "close": 99.0,
+        }
+        current = {
+            "candidate_zscore": -2.35,
+            "close": 99.5,
+            "mr_atr_bucket": "low",
+            "mr_regime_confirmed": True,
+        }
+
+        accepted, reason, direction = self.module.evaluate_mean_reversion_candidate_signal(
+            current,
+            previous,
+            self.config,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+        self.assertEqual(direction, "LONG")
+
+    def test_funding_cashflow_has_opposite_sign_for_long_and_short(self):
+        rates = self.module.pd.DataFrame(
+            [
+                {"funding_time": 1000, "funding_rate": 0.0001, "mark_price": 100.0},
+                {"funding_time": 2000, "funding_rate": -0.0002, "mark_price": 101.0},
+            ]
+        )
+        base = {
+            "entry_open_time_ms": 0,
+            "entry_price": 100.0,
+            "quantity": 1.0,
+        }
+
+        long_pnl = self.module.candidate_funding_pnl({**base, "side": "LONG"}, 3000, rates)
+        short_pnl = self.module.candidate_funding_pnl({**base, "side": "SHORT"}, 3000, rates)
+
+        self.assertAlmostEqual(long_pnl, 0.0102)
+        self.assertAlmostEqual(short_pnl, -0.0102)
+
+    def test_overlapping_walk_forward_trades_are_deduplicated(self):
+        trade = {
+            "strategy_id": self.module.CANDIDATE_TREND_LONG_NAME,
+            "side": "LONG",
+            "entry_time": "2026-01-01 00:00 UTC",
+            "exit_time": "2026-01-01 01:00 UTC",
+            "net_pnl": 0.01,
+        }
+
+        unique = self.module.deduplicate_candidate_trades([trade, dict(trade)])
+
+        self.assertEqual(len(unique), 1)
+
+    def test_candidate_replay_orchestrates_independent_rolling_ledgers(self):
+        day_ms = 24 * 60 * 60 * 1000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "klines.csv"
+            funding_path = Path(temp_dir) / "funding.csv"
+            output_path = Path(temp_dir) / "output"
+            cache_path.write_text("cached", encoding="utf-8")
+            funding_path.write_text("cached", encoding="utf-8")
+            params = self.module.replace(
+                self.params,
+                walk_forward_train_days=1,
+                walk_forward_validation_days=1,
+                walk_forward_test_days=1,
+                walk_forward_step_days=1,
+                minimum_walk_forward_windows=1,
+                minimum_train_trades=1,
+                minimum_out_of_sample_trades=1,
+                bootstrap_samples=20,
+            )
+            kline_frame = self.module.pd.DataFrame(
+                [
+                    {
+                        "open_time": 0,
+                        "open": 100.0,
+                        "high": 100.1,
+                        "low": 99.9,
+                        "close": 100.0,
+                        "volume": 1.0,
+                        "close_time": 59999,
+                    }
+                ]
+            )
+            funding_frame = self.module.pd.DataFrame(
+                [{"funding_time": 1000, "funding_rate": 0.0, "mark_price": 100.0}]
+            )
+
+            def fake_replay(
+                _config,
+                _filters,
+                _features,
+                start_ms,
+                end_ms,
+                strategy_id,
+                replay_params,
+                **_kwargs,
+            ):
+                side = "SHORT" if strategy_id == self.module.CANDIDATE_TREND_SHORT_NAME else "LONG"
+                trade = {
+                    "strategy_id": strategy_id,
+                    "side": side,
+                    "entry_time": self.module.candle_time_text(start_ms),
+                    "exit_time": self.module.candle_time_text(start_ms + 60000),
+                    "entry_price": 100.0,
+                    "exit_price": 100.8 if side == "LONG" else 99.2,
+                    "quantity": 0.1,
+                    "entry_notional": 10.0,
+                    "exit_notional": 10.08 if side == "LONG" else 9.92,
+                    "gross_pnl": 0.08,
+                    "fees": 0.01,
+                    "slippage": 0.004,
+                    "spread_cost": 0.002,
+                    "funding_pnl": 0.0,
+                    "execution_cost": 0.016,
+                    "net_pnl": 0.064,
+                    "mfe_pct": 0.01,
+                    "mae_pct": 0.002,
+                    "mfe_usdt": 0.1,
+                    "mae_usdt": 0.02,
+                    "holding_seconds": 60.0,
+                    "exit_reason": "TAKE_PROFIT",
+                    "result": "WIN",
+                }
+                report = self.module.build_candidate_direction_report([trade], 1, replay_params)
+                report.update(
+                    {
+                        "strategy_id": strategy_id,
+                        "segment_start": self.module.candle_time_text(start_ms),
+                        "segment_end_exclusive": self.module.candle_time_text(end_ms),
+                    }
+                )
+                return {"report": report, "trades": [trade]}
+
+            with mock.patch.object(self.module, "aligned_replay_end_ms", return_value=3 * day_ms), mock.patch.object(
+                self.module, "build_public_replay_client", return_value=object()
+            ), mock.patch.object(self.module, "get_exchange_filters", return_value=self.filters), mock.patch.object(
+                self.module, "ensure_historical_kline_cache", return_value=kline_frame
+            ), mock.patch.object(
+                self.module, "ensure_funding_rate_cache", return_value=funding_frame
+            ), mock.patch.object(
+                self.module,
+                "build_candidate_feature_frame",
+                return_value=self.module.pd.DataFrame({"close_time": [0]}),
+            ), mock.patch.object(
+                self.module, "candidate_replay_strategy", side_effect=fake_replay
+            ):
+                summary = self.module.run_candidate_replay(
+                    self.config,
+                    days=3,
+                    end_time=None,
+                    cache_file=str(cache_path),
+                    funding_cache_file=str(funding_path),
+                    output_dir_value=str(output_path),
+                    params=params,
+                )
+
+            self.assertEqual(summary["engine"], "independent_strategy_rolling_walk_forward_v2")
+            self.assertEqual(summary["walk_forward"]["window_count"], 1)
+            self.assertEqual(
+                set(summary["out_of_sample_validation"]),
+                set(self.module.CANDIDATE_LEDGER_NAMES),
+            )
+            self.assertTrue((output_path / "latest.json").exists())
 
 
 class LiveSafetyTests(EnvTestCase):

@@ -1455,6 +1455,36 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             price_precision=2,
         )
 
+    def test_candidate_profiles_are_versioned_and_reproducible(self):
+        v3 = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V3
+        )
+        v4 = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V4
+        )
+        v5 = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V5
+        )
+
+        self.assertEqual((v3.execution_interval, v3.trend_interval), ("5m", "15m"))
+        self.assertEqual((v4.execution_interval, v4.trend_interval), ("15m", "1h"))
+        self.assertEqual((v5.execution_interval, v5.trend_interval), ("30m", "2h"))
+        self.assertEqual(v5.default_replay_days, 900)
+        self.assertEqual(v5.embargo_minutes, v5.max_holding_minutes)
+        with self.assertRaises(self.module.ConfigError):
+            self.module.candidate_replay_parameters_for_profile("unknown")
+
+    def test_candidate_replay_cli_selects_profile_without_overwriting_days(self):
+        defaults = self.module.parse_candidate_replay_args([])
+        selected = self.module.parse_candidate_replay_args(
+            ["--profile", self.module.CANDIDATE_PROFILE_V5, "--days", "930"]
+        )
+
+        self.assertEqual(defaults.profile, self.module.CANDIDATE_PROFILE_V4)
+        self.assertIsNone(defaults.days)
+        self.assertEqual(selected.profile, self.module.CANDIDATE_PROFILE_V5)
+        self.assertEqual(selected.days, 930)
+
     def _signal_rows(self, atr_execution):
         previous = {
             "open_time": 0,
@@ -1631,6 +1661,52 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertTrue(long_report["gate"]["eligible"])
         self.assertFalse(short_report["gate"]["eligible"])
         self.assertIn("NON_POSITIVE_EXPECTANCY", short_report["gate"]["failure_reasons"])
+
+    def test_historical_gate_can_only_qualify_for_forward_shadow(self):
+        params = self.module.replace(
+            self.params,
+            minimum_train_trades=1,
+            minimum_out_of_sample_trades=1,
+            minimum_walk_forward_windows=1,
+            bootstrap_samples=20,
+            bootstrap_block_trades=2,
+        )
+        winning_trade = {
+            "gross_pnl": 0.10,
+            "fees": 0.01,
+            "slippage": 0.005,
+            "spread_cost": 0.005,
+            "funding_pnl": 0.0,
+            "net_pnl": 0.08,
+            "mfe_pct": 0.02,
+            "mae_pct": 0.003,
+            "mfe_usdt": 0.20,
+            "mae_usdt": 0.03,
+            "holding_seconds": 3600.0,
+            "exit_reason": "TAKE_PROFIT",
+        }
+        losing_trade = {
+            **winning_trade,
+            "gross_pnl": -0.03,
+            "net_pnl": -0.05,
+            "exit_reason": "STOP_LOSS",
+        }
+        trades = [dict(winning_trade) for _ in range(9)] + [losing_trade]
+        report = self.module.build_candidate_direction_report(trades, 1, params)
+        fixed_segments = {segment: list(trades) for segment in ("train", "validation", "test")}
+        window_reports = {segment: [report] for segment in ("train", "validation", "test")}
+
+        result = self.module.build_walk_forward_strategy_validation(
+            self.module.CANDIDATE_TREND_LONG_NAME,
+            fixed_segments,
+            {"report": report},
+            window_reports,
+            params,
+        )
+
+        self.assertTrue(result["historical_gate_passed"])
+        self.assertTrue(result["eligible_for_forward_shadow_validation"])
+        self.assertFalse(result["eligible_for_micro_live_test"])
 
     def test_candidate_features_never_attach_an_unclosed_future_trend_candle(self):
         rows = []
@@ -1982,8 +2058,11 @@ class CostAwareCandidateReplayTests(EnvTestCase):
                 )
 
             self.assertEqual(summary["engine"], "trend_pullback_15m_1h_rolling_walk_forward_v4")
+            self.assertEqual(summary["profile_name"], self.module.CANDIDATE_PROFILE_V4)
             self.assertEqual(summary["execution_interval"], "15m")
             self.assertEqual(summary["trend_interval"], "1h")
+            self.assertTrue(summary["fresh_forward_validation_required"])
+            self.assertEqual(summary["eligible_strategies"], [])
             self.assertEqual(summary["walk_forward"]["window_count"], 1)
             self.assertEqual(
                 set(summary["out_of_sample_validation"]),

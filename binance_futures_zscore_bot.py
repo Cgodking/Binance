@@ -48,6 +48,14 @@ REPLAY_MIN_TEST_TRADES = 100
 REPLAY_MIN_NET_PROFIT_FACTOR = 1.10
 REPLAY_MAX_DRAWDOWN_USDT = 0.20
 CANDIDATE_STRATEGY_NAME = "COST_AWARE_STABLE_TREND_PULLBACK"
+CANDIDATE_PROFILE_V3 = "v3_5m_15m"
+CANDIDATE_PROFILE_V4 = "v4_15m_1h"
+CANDIDATE_PROFILE_V5 = "v5_30m_2h"
+CANDIDATE_REPLAY_PROFILES = (
+    CANDIDATE_PROFILE_V3,
+    CANDIDATE_PROFILE_V4,
+    CANDIDATE_PROFILE_V5,
+)
 CANDIDATE_DIRECTIONS = ("LONG", "SHORT")
 CANDIDATE_TREND_LONG_NAME = "TREND_PULLBACK_LONG"
 CANDIDATE_TREND_SHORT_NAME = "TREND_PULLBACK_SHORT"
@@ -327,6 +335,9 @@ class Config:
 @dataclass(frozen=True)
 class CandidateReplayParameters:
     strategy_name: str = CANDIDATE_STRATEGY_NAME
+    profile_name: str = CANDIDATE_PROFILE_V4
+    engine_name: str = "trend_pullback_15m_1h_rolling_walk_forward_v4"
+    default_replay_days: int = 600
     execution_interval: str = "15m"
     trend_interval: str = "1h"
     trend_fast_ema_period: int = 20
@@ -368,6 +379,57 @@ class CandidateReplayParameters:
     minimum_net_profit_factor: float = 1.15
     maximum_drawdown_usdt: float = 0.20
     maximum_cost_to_gross_profit_ratio: float = 0.30
+    requires_fresh_forward_validation: bool = True
+
+
+def candidate_replay_parameters_for_profile(profile_name: str) -> CandidateReplayParameters:
+    normalized = str(profile_name or "").strip().lower()
+    base = CandidateReplayParameters()
+    if normalized == CANDIDATE_PROFILE_V4:
+        return base
+    if normalized == CANDIDATE_PROFILE_V3:
+        return replace(
+            base,
+            profile_name=CANDIDATE_PROFILE_V3,
+            engine_name="trend_pullback_5m_15m_rolling_walk_forward_v3",
+            default_replay_days=600,
+            execution_interval="5m",
+            trend_interval="15m",
+            atr_percentile_window=288,
+            minimum_stop_loss_pct=0.0035,
+            maximum_stop_loss_pct=0.0120,
+            minimum_take_profit_pct=0.0080,
+            maximum_take_profit_pct=0.0240,
+            max_holding_minutes=120,
+            cooldown_minutes=15,
+            executable_max_net_loss_per_trade_usdt=0.04,
+            walk_forward_train_days=120,
+            walk_forward_validation_days=30,
+            walk_forward_test_days=30,
+            walk_forward_step_days=30,
+        )
+    if normalized == CANDIDATE_PROFILE_V5:
+        return replace(
+            base,
+            profile_name=CANDIDATE_PROFILE_V5,
+            engine_name="trend_pullback_30m_2h_rolling_walk_forward_v5",
+            default_replay_days=900,
+            execution_interval="30m",
+            trend_interval="2h",
+            atr_percentile_window=48,
+            minimum_stop_loss_pct=0.0060,
+            maximum_stop_loss_pct=0.0250,
+            minimum_take_profit_pct=0.0150,
+            maximum_take_profit_pct=0.0500,
+            max_holding_minutes=960,
+            cooldown_minutes=120,
+            walk_forward_train_days=270,
+            walk_forward_validation_days=90,
+            walk_forward_test_days=90,
+            walk_forward_step_days=90,
+            embargo_minutes=960,
+        )
+    raise ConfigError(f"Unsupported candidate replay profile: {profile_name}")
 
 
 @dataclass(frozen=True)
@@ -5083,6 +5145,7 @@ def build_walk_forward_strategy_validation(
         failures.append("NO_RISK_SIZED_ORDERS_FIT_EXCHANGE_FILTERS")
     elif float(risk_report.get("net_pnl", 0.0) or 0.0) <= 0:
         failures.append("NON_POSITIVE_RISK_SIZED_NET_PNL")
+    historical_gate_passed = not failures
     return {
         "strategy_id": strategy_id,
         "preselection": {
@@ -5105,7 +5168,10 @@ def build_walk_forward_strategy_validation(
             "positive_window_fraction": positive_window_fraction if total_windows else None,
             "window_test_reports": list(window_reports_by_segment["test"]),
         },
-        "eligible_for_micro_live_test": not failures,
+        "historical_gate_passed": historical_gate_passed,
+        "eligible_for_forward_shadow_validation": historical_gate_passed,
+        "eligible_for_micro_live_test": historical_gate_passed
+        and not params.requires_fresh_forward_validation,
         "failure_reasons": failures,
     }
 
@@ -5288,18 +5354,19 @@ def run_candidate_replay(
             risk_test_result["trades"],
         )
 
-    eligible_strategies = sorted(
+    forward_shadow_candidates = sorted(
         strategy_id
         for strategy_id, result in validation.items()
-        if bool(result["eligible_for_micro_live_test"])
+        if bool(result["eligible_for_forward_shadow_validation"])
     )
     viability_status = (
-        "ELIGIBLE_FOR_MICRO_LIVE_TEST"
-        if eligible_strategies
+        "ELIGIBLE_FOR_FORWARD_SHADOW_VALIDATION"
+        if forward_shadow_candidates
         else "NOT_VIABLE_OR_INSUFFICIENT_OUT_OF_SAMPLE_EVIDENCE"
     )
     summary = {
-        "engine": "trend_pullback_15m_1h_rolling_walk_forward_v4",
+        "engine": params.engine_name,
+        "profile_name": params.profile_name,
         "generated_at": utc_now_text(),
         "run_id": run_id,
         "strategies": list(CANDIDATE_LEDGER_NAMES),
@@ -5316,6 +5383,8 @@ def run_candidate_replay(
         "forward_shadow_execution_enabled": config.forward_shadow_execution_enabled,
         "ui_changed": False,
         "strategy_parameters_frozen": True,
+        "historical_profile_selection_is_not_live_evidence": True,
+        "fresh_forward_validation_required": params.requires_fresh_forward_validation,
         "continuous_master_replay_per_strategy": True,
         "master_replay_count": len(CANDIDATE_LEDGER_NAMES),
         "window_metrics_are_sliced_from_master_replays": True,
@@ -5341,9 +5410,14 @@ def run_candidate_replay(
         },
         "windows": window_summaries,
         "out_of_sample_validation": validation,
-        "eligible_strategies": eligible_strategies,
+        "eligible_strategies": [],
+        "forward_shadow_candidate_strategies": forward_shadow_candidates,
         "viability_status": viability_status,
-        "recommendation": viability_status if eligible_strategies else "DO_NOT_TRADE_LIVE",
+        "recommendation": (
+            "BEGIN_FORWARD_SHADOW_VALIDATION"
+            if forward_shadow_candidates
+            else "DO_NOT_TRADE_LIVE"
+        ),
     }
     write_json_atomic(run_dir / "summary.json", summary)
     write_json_atomic(output_dir / "latest.json", summary)
@@ -5352,7 +5426,8 @@ def run_candidate_replay(
 
 def parse_candidate_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run independent rolling walk-forward strategy validation")
-    parser.add_argument("--days", type=int, default=600)
+    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V4)
+    parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--end-time", default=None)
     parser.add_argument("--cache-file", default="historical_data/SOLUSDT_1m.csv")
     parser.add_argument("--funding-cache-file", default=None)
@@ -5363,12 +5438,14 @@ def parse_candidate_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
 def candidate_replay_main(arguments: Sequence[str]) -> None:
     args = parse_candidate_replay_args(arguments)
     config = load_config()
+    params = candidate_replay_parameters_for_profile(args.profile)
     summary = run_candidate_replay(
         config,
-        days=args.days,
+        days=args.days or params.default_replay_days,
         end_time=args.end_time,
         cache_file=args.cache_file,
         output_dir_value=args.output_dir,
+        params=params,
         funding_cache_file=args.funding_cache_file,
     )
     print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))

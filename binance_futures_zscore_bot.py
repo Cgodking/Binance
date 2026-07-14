@@ -204,7 +204,7 @@ CANDIDATE_TRADE_FIELDNAMES = [
     "entry_ema_spread_pct",
     "entry_ema_slope_consistency",
     "entry_trend_persistence",
-    "entry_atr_15m",
+    "entry_trend_atr",
     "entry_execution_interval",
     "entry_atr_execution",
     "entry_atr_execution_pct",
@@ -327,7 +327,8 @@ class Config:
 @dataclass(frozen=True)
 class CandidateReplayParameters:
     strategy_name: str = CANDIDATE_STRATEGY_NAME
-    execution_interval: str = "5m"
+    execution_interval: str = "15m"
+    trend_interval: str = "1h"
     trend_fast_ema_period: int = 20
     trend_slow_ema_period: int = 50
     trend_atr_period: int = 14
@@ -336,25 +337,25 @@ class CandidateReplayParameters:
     min_slope_consistency: float = 0.80
     min_ema_spread_pct: float = 0.0020
     atr_execution_period: int = 14
-    atr_percentile_window: int = 288
+    atr_percentile_window: int = 96
     max_atr_percentile: float = 0.70
     max_pullback_distance_atr: float = 0.70
     stop_loss_atr_multiple: float = 1.50
     take_profit_atr_multiple: float = 3.00
-    minimum_stop_loss_pct: float = 0.0035
-    maximum_stop_loss_pct: float = 0.0120
-    minimum_take_profit_pct: float = 0.0080
-    maximum_take_profit_pct: float = 0.0240
-    max_holding_minutes: int = 120
-    cooldown_minutes: int = 15
+    minimum_stop_loss_pct: float = 0.0055
+    maximum_stop_loss_pct: float = 0.0200
+    minimum_take_profit_pct: float = 0.0120
+    maximum_take_profit_pct: float = 0.0400
+    max_holding_minutes: int = 480
+    cooldown_minutes: int = 60
     fixed_notional_usdt: float = 10.0
     starting_equity_usdt: float = 5.0
-    executable_max_net_loss_per_trade_usdt: float = 0.04
+    executable_max_net_loss_per_trade_usdt: float = 0.05
     executable_max_risk_per_trade_pct: float = 0.01
-    walk_forward_train_days: int = 120
-    walk_forward_validation_days: int = 30
-    walk_forward_test_days: int = 30
-    walk_forward_step_days: int = 30
+    walk_forward_train_days: int = 180
+    walk_forward_validation_days: int = 60
+    walk_forward_test_days: int = 60
+    walk_forward_step_days: int = 60
     embargo_minutes: int = 240
     minimum_walk_forward_windows: int = 6
     cost_stress_multipliers: Tuple[float, ...] = (1.0, 1.5, 2.0)
@@ -3917,10 +3918,11 @@ def build_candidate_feature_frame(
     all_klines: pd.DataFrame,
     params: CandidateReplayParameters,
     source_interval: str = "1m",
-    trend_interval: str = "15m",
+    trend_interval: Optional[str] = None,
     config: Optional[Config] = None,
 ) -> pd.DataFrame:
     feature_config = config or Config()
+    candidate_trend_interval = trend_interval or params.trend_interval
     source = all_klines[HISTORICAL_KLINE_COLUMNS].copy().sort_values("close_time").reset_index(drop=True)
     for column in ("open", "high", "low", "close", "volume"):
         source[column] = pd.to_numeric(source[column], errors="coerce")
@@ -3995,12 +3997,12 @@ def build_candidate_feature_frame(
         primary["mr_ema_crosses"] >= feature_config.regime_min_ema_crosses
     )
 
-    trend = resample_closed_klines(primary, params.execution_interval, trend_interval)
+    trend = resample_closed_klines(primary, params.execution_interval, candidate_trend_interval)
     for column in ("open", "high", "low", "close", "volume"):
         trend[column] = pd.to_numeric(trend[column], errors="coerce")
     trend["trend_ema20"] = trend["close"].ewm(span=params.trend_fast_ema_period, adjust=False).mean()
     trend["trend_ema50"] = trend["close"].ewm(span=params.trend_slow_ema_period, adjust=False).mean()
-    trend["trend_atr_15m"] = candidate_true_range(trend).rolling(params.trend_atr_period).mean()
+    trend["trend_atr"] = candidate_true_range(trend).rolling(params.trend_atr_period).mean()
     trend["trend_ema_spread_pct"] = (
         (trend["trend_ema20"] - trend["trend_ema50"]).abs() / trend["close"]
     )
@@ -4026,7 +4028,7 @@ def build_candidate_feature_frame(
         "trend_feature_close_time",
         "trend_ema20",
         "trend_ema50",
-        "trend_atr_15m",
+        "trend_atr",
         "trend_ema_spread_pct",
         "trend_side",
         "trend_persistence",
@@ -4320,7 +4322,7 @@ def close_candidate_position(
         "entry_ema_spread_pct": position["entry_ema_spread_pct"],
         "entry_ema_slope_consistency": position["entry_ema_slope_consistency"],
         "entry_trend_persistence": position["entry_trend_persistence"],
-        "entry_atr_15m": position["entry_atr_15m"],
+        "entry_trend_atr": position["entry_trend_atr"],
         "entry_execution_interval": position["entry_execution_interval"],
         "entry_atr_execution": position["entry_atr_execution"],
         "entry_atr_execution_pct": position["entry_atr_execution_pct"],
@@ -4605,7 +4607,7 @@ def candidate_replay_strategy(
             "entry_ema_spread_pct": float(row["trend_ema_spread_pct"]),
             "entry_ema_slope_consistency": slope_value,
             "entry_trend_persistence": int(row["trend_persistence"]),
-            "entry_atr_15m": float(row["trend_atr_15m"]),
+            "entry_trend_atr": float(row["trend_atr"]),
             "entry_execution_interval": params.execution_interval,
             "entry_atr_execution": float(row["atr_execution"]),
             "entry_atr_execution_pct": float(row["atr_execution_pct"]),
@@ -5131,7 +5133,7 @@ def run_candidate_replay(
     windows = rolling_walk_forward_boundaries(days, end_exclusive_ms, params)
     source_seconds = interval_seconds(config.interval)
     execution_seconds = interval_seconds(params.execution_interval)
-    trend_seconds = interval_seconds(config.trend_interval)
+    trend_seconds = interval_seconds(params.trend_interval)
     if source_seconds is None or execution_seconds is None or trend_seconds is None:
         raise ConfigError("Candidate replay intervals are invalid")
     if execution_seconds % source_seconds != 0 or trend_seconds % execution_seconds != 0:
@@ -5166,7 +5168,7 @@ def run_candidate_replay(
         all_klines,
         params,
         config.interval,
-        config.trend_interval,
+        params.trend_interval,
         config=config,
     )
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -5297,7 +5299,7 @@ def run_candidate_replay(
         else "NOT_VIABLE_OR_INSUFFICIENT_OUT_OF_SAMPLE_EVIDENCE"
     )
     summary = {
-        "engine": "trend_pullback_5m_15m_rolling_walk_forward_v3",
+        "engine": "trend_pullback_15m_1h_rolling_walk_forward_v4",
         "generated_at": utc_now_text(),
         "run_id": run_id,
         "strategies": list(CANDIDATE_LEDGER_NAMES),
@@ -5305,7 +5307,7 @@ def run_candidate_replay(
         "symbol": config.symbol,
         "source_interval": config.interval,
         "execution_interval": params.execution_interval,
-        "trend_interval": config.trend_interval,
+        "trend_interval": params.trend_interval,
         "days": days,
         "shadow_mode_only": True,
         "dry_run": True,

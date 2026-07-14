@@ -1466,7 +1466,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             "trend_feature_close_time": 59999,
             "trend_ema20": 100.0,
             "trend_ema50": 99.0,
-            "trend_atr_15m": 2.0,
+            "trend_atr": 2.0,
             "atr_execution": atr_execution,
             "atr_execution_pct": atr_execution / 100.8,
             "atr_execution_percentile": 0.5,
@@ -1481,7 +1481,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             "trend_feature_close_time": 119999,
             "trend_ema20": 100.0,
             "trend_ema50": 99.0,
-            "trend_atr_15m": 2.0,
+            "trend_atr": 2.0,
             "trend_ema_spread_pct": 0.01,
             "trend_side": 1,
             "trend_persistence": 5,
@@ -1566,7 +1566,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
                 "open_time": 180000,
                 "close_time": 239999,
                 "open": 103.5,
-                "high": 103.8,
+                "high": 106.2,
                 "low": 103.0,
                 "close": 103.6,
                 "trend_feature_close_time": 239999,
@@ -1589,7 +1589,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertEqual(trade["entry_price"], 102.0)
         self.assertEqual(trade["exit_reason"], "TAKE_PROFIT")
         self.assertAlmostEqual(trade["mfe_pct"], trade["initial_take_profit_distance_pct"])
-        self.assertEqual(trade["mae_pct"], 0.0)
+        self.assertAlmostEqual(trade["mae_pct"], (102.0 - 101.8) / 102.0)
         self.assertGreater(trade["fees"], 0.0)
         self.assertGreater(trade["slippage"], 0.0)
 
@@ -1652,8 +1652,8 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         features = self.module.build_candidate_feature_frame(frame, self.params)
         available = features.dropna(subset=["trend_feature_close_time"])
 
-        self.assertTrue((features["open_time"] % (5 * 60 * 1000) == 0).all())
-        self.assertEqual(len(features), 240)
+        self.assertTrue((features["open_time"] % (15 * 60 * 1000) == 0).all())
+        self.assertEqual(len(features), 80)
         self.assertTrue((available["trend_feature_close_time"] <= available["close_time"]).all())
 
     def test_candidate_replay_refuses_any_non_shadow_safety_configuration(self):
@@ -1671,16 +1671,16 @@ class CostAwareCandidateReplayTests(EnvTestCase):
     def test_candidate_cost_gate_matches_fee_and_slippage_assumptions(self):
         ratio = self.module.candidate_estimated_tp_cost_ratio(self.config, self.params)
 
-        self.assertAlmostEqual(ratio, 0.20)
+        self.assertAlmostEqual(ratio, 0.0016 / 0.012)
         self.assertLessEqual(ratio, self.params.maximum_tp_cost_ratio)
 
-    def test_rolling_walk_forward_uses_fifteen_recent_windows_and_embargo(self):
+    def test_rolling_walk_forward_uses_six_recent_windows_and_embargo(self):
         day_ms = 24 * 60 * 60 * 1000
         end_ms = 1000 * day_ms
 
         windows = self.module.rolling_walk_forward_boundaries(600, end_ms, self.params)
 
-        self.assertEqual(len(windows), 15)
+        self.assertEqual(len(windows), 6)
         self.assertEqual(windows[-1]["test"][1], end_ms)
         embargo_ms = self.params.embargo_minutes * 60 * 1000
         for window in windows:
@@ -1708,7 +1708,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             {
                 "open_time": 180000,
                 "close_time": 239999,
-                "open": 100.0,
+                "open": 99.5,
                 "high": 100.5,
                 "low": 99.5,
                 "close": 100.2,
@@ -1729,7 +1729,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
 
         trade = result["trades"][0]
         self.assertEqual(trade["exit_reason"], "STOP_LOSS_GAP")
-        self.assertEqual(trade["exit_price"], 100.0)
+        self.assertEqual(trade["exit_price"], 99.5)
         self.assertTrue(trade["gap_exit"])
         self.assertLess(trade["net_pnl"], -0.1)
 
@@ -1762,8 +1762,8 @@ class CostAwareCandidateReplayTests(EnvTestCase):
 
         self.assertEqual(result["report"]["trades"], 1)
         self.assertEqual(result["report"]["starting_equity_usdt"], 5.0)
-        self.assertEqual(result["report"]["maximum_net_loss_per_trade_usdt"], 0.04)
-        self.assertLessEqual(result["trades"][0]["estimated_net_loss_usdt"], 0.04)
+        self.assertEqual(result["report"]["maximum_net_loss_per_trade_usdt"], 0.05)
+        self.assertLessEqual(result["trades"][0]["estimated_net_loss_usdt"], 0.05)
 
     def test_five_usdt_risk_overlay_still_rejects_when_research_cap_is_too_low(self):
         source_trade = {
@@ -1981,7 +1981,9 @@ class CostAwareCandidateReplayTests(EnvTestCase):
                     params=params,
                 )
 
-            self.assertEqual(summary["engine"], "trend_pullback_5m_15m_rolling_walk_forward_v3")
+            self.assertEqual(summary["engine"], "trend_pullback_15m_1h_rolling_walk_forward_v4")
+            self.assertEqual(summary["execution_interval"], "15m")
+            self.assertEqual(summary["trend_interval"], "1h")
             self.assertEqual(summary["walk_forward"]["window_count"], 1)
             self.assertEqual(
                 set(summary["out_of_sample_validation"]),

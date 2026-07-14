@@ -55,8 +55,11 @@ CANDIDATE_MEAN_REVERSION_NAME = "MEAN_REVERSION_INDEPENDENT"
 CANDIDATE_LEDGER_NAMES = (
     CANDIDATE_TREND_LONG_NAME,
     CANDIDATE_TREND_SHORT_NAME,
+)
+LEGACY_CANDIDATE_LEDGER_NAMES = (
     CANDIDATE_MEAN_REVERSION_NAME,
 )
+SUPPORTED_CANDIDATE_LEDGER_NAMES = CANDIDATE_LEDGER_NAMES + LEGACY_CANDIDATE_LEDGER_NAMES
 ELITE_STRATEGY_NAME = "ELITE_LONG_STRATEGY"
 SHADOW_PROBE_STRATEGY_NAME = "SHADOW_PROBE_STRATEGY"
 ROUTER_NAME = "REGIME_STRATEGY_ROUTER"
@@ -202,9 +205,13 @@ CANDIDATE_TRADE_FIELDNAMES = [
     "entry_ema_slope_consistency",
     "entry_trend_persistence",
     "entry_atr_15m",
-    "entry_atr_1m_pct",
-    "entry_atr_1m_percentile",
+    "entry_execution_interval",
+    "entry_atr_execution",
+    "entry_atr_execution_pct",
+    "entry_atr_execution_percentile",
     "pullback_distance_atr",
+    "initial_stop_distance_pct",
+    "initial_take_profit_distance_pct",
     "entry_zscore",
     "gross_pnl",
     "fees",
@@ -305,6 +312,7 @@ class Config:
     shadow_probe_max_abs_z: float = 4.00
     shadow_probe_allow_short: bool = True
     shadow_probe_max_holding_minutes: int = 120
+    forward_shadow_execution_enabled: bool = False
     market_gate_enforced: bool = False
     regime_stability_window: int = 20
     min_regime_persistence_candles: int = 10
@@ -319,6 +327,7 @@ class Config:
 @dataclass(frozen=True)
 class CandidateReplayParameters:
     strategy_name: str = CANDIDATE_STRATEGY_NAME
+    execution_interval: str = "5m"
     trend_fast_ema_period: int = 20
     trend_slow_ema_period: int = 50
     trend_atr_period: int = 14
@@ -326,20 +335,26 @@ class CandidateReplayParameters:
     slope_consistency_window: int = 5
     min_slope_consistency: float = 0.80
     min_ema_spread_pct: float = 0.0020
-    atr_1m_period: int = 14
-    atr_percentile_window: int = 240
+    atr_execution_period: int = 14
+    atr_percentile_window: int = 288
     max_atr_percentile: float = 0.70
-    max_pullback_distance_atr: float = 0.35
-    stop_loss_pct: float = 0.0055
-    take_profit_pct: float = 0.0100
-    max_holding_minutes: int = 240
+    max_pullback_distance_atr: float = 0.70
+    stop_loss_atr_multiple: float = 1.50
+    take_profit_atr_multiple: float = 3.00
+    minimum_stop_loss_pct: float = 0.0035
+    maximum_stop_loss_pct: float = 0.0120
+    minimum_take_profit_pct: float = 0.0080
+    maximum_take_profit_pct: float = 0.0240
+    max_holding_minutes: int = 120
     cooldown_minutes: int = 15
     fixed_notional_usdt: float = 10.0
-    starting_equity_usdt: float = 1.5
-    walk_forward_train_days: int = 180
-    walk_forward_validation_days: int = 60
-    walk_forward_test_days: int = 60
-    walk_forward_step_days: int = 60
+    starting_equity_usdt: float = 5.0
+    executable_max_net_loss_per_trade_usdt: float = 0.04
+    executable_max_risk_per_trade_pct: float = 0.01
+    walk_forward_train_days: int = 120
+    walk_forward_validation_days: int = 30
+    walk_forward_test_days: int = 30
+    walk_forward_step_days: int = 30
     embargo_minutes: int = 240
     minimum_walk_forward_windows: int = 6
     cost_stress_multipliers: Tuple[float, ...] = (1.0, 1.5, 2.0)
@@ -347,7 +362,8 @@ class CandidateReplayParameters:
     bootstrap_block_trades: int = 8
     maximum_tp_cost_ratio: float = 0.20
     minimum_train_trades: int = 100
-    minimum_out_of_sample_trades: int = 40
+    minimum_out_of_sample_trades: int = 100
+    minimum_positive_window_fraction: float = 0.60
     minimum_net_profit_factor: float = 1.15
     maximum_drawdown_usdt: float = 0.20
     maximum_cost_to_gross_profit_ratio: float = 0.30
@@ -721,7 +737,11 @@ class RuntimeState:
             has_open_position = bool(self.shadow.get("router_position"))
 
             if not has_open_position and signal_row["trade_decision"] == "ENTER":
-                if config.market_gate_enforced and not bool(signal_row.get("trade_allowed_by_market_gate", False)):
+                if not config.forward_shadow_execution_enabled:
+                    signal_row["trade_decision"] = "REJECT"
+                    signal_row["failed_filter"] = "research_phase"
+                    signal_row["rejection_reason"] = "FORWARD_SHADOW_EXECUTION_DISABLED"
+                elif config.market_gate_enforced and not bool(signal_row.get("trade_allowed_by_market_gate", False)):
                     signal_row["trade_decision"] = "REJECT"
                     signal_row["failed_filter"] = "market_gate"
                     signal_row["rejection_reason"] = str(
@@ -1056,6 +1076,10 @@ def load_config() -> Config:
         shadow_probe_max_abs_z=parse_float_env("SHADOW_PROBE_MAX_ABS_Z", 4.00, minimum=0.0),
         shadow_probe_allow_short=parse_bool_env("SHADOW_PROBE_ALLOW_SHORT", True),
         shadow_probe_max_holding_minutes=parse_int_env("SHADOW_PROBE_MAX_HOLDING_MINUTES", 120, minimum=1),
+        forward_shadow_execution_enabled=parse_bool_env(
+            "FORWARD_SHADOW_EXECUTION_ENABLED",
+            False,
+        ),
         market_gate_enforced=parse_bool_env("MARKET_GATE_ENFORCED", False),
         regime_stability_window=parse_int_env("REGIME_STABILITY_WINDOW", 20, minimum=5),
         min_regime_persistence_candles=parse_int_env("MIN_REGIME_PERSISTENCE_CANDLES", 10, minimum=1),
@@ -3897,13 +3921,21 @@ def build_candidate_feature_frame(
     config: Optional[Config] = None,
 ) -> pd.DataFrame:
     feature_config = config or Config()
-    primary = all_klines[HISTORICAL_KLINE_COLUMNS].copy().sort_values("close_time").reset_index(drop=True)
+    source = all_klines[HISTORICAL_KLINE_COLUMNS].copy().sort_values("close_time").reset_index(drop=True)
+    for column in ("open", "high", "low", "close", "volume"):
+        source[column] = pd.to_numeric(source[column], errors="coerce")
+    if params.execution_interval == source_interval:
+        primary = source.copy()
+    else:
+        primary = resample_closed_klines(source, source_interval, params.execution_interval)
     for column in ("open", "high", "low", "close", "volume"):
         primary[column] = pd.to_numeric(primary[column], errors="coerce")
-    primary["atr_1m"] = candidate_true_range(primary).rolling(params.atr_1m_period).mean()
-    primary["atr_1m_pct"] = primary["atr_1m"] / primary["close"]
-    primary["atr_1m_percentile"] = (
-        primary["atr_1m_pct"]
+    primary["atr_execution"] = candidate_true_range(primary).rolling(
+        params.atr_execution_period
+    ).mean()
+    primary["atr_execution_pct"] = primary["atr_execution"] / primary["close"]
+    primary["atr_execution_percentile"] = (
+        primary["atr_execution_pct"]
         .rolling(params.atr_percentile_window, min_periods=params.atr_percentile_window)
         .rank(pct=True)
     )
@@ -3942,10 +3974,10 @@ def build_candidate_feature_frame(
     ).sum()
     primary["mr_atr_bucket"] = np.select(
         [
-            (primary["atr_1m_percentile"] <= feature_config.regime_low_atr_percentile)
-            & (primary["atr_1m_pct"] <= feature_config.max_atr_pct),
-            (primary["atr_1m_percentile"] >= feature_config.regime_high_atr_percentile)
-            | (primary["atr_1m_pct"] > feature_config.max_atr_pct),
+            (primary["atr_execution_percentile"] <= feature_config.regime_low_atr_percentile)
+            & (primary["atr_execution_pct"] <= feature_config.max_atr_pct),
+            (primary["atr_execution_percentile"] >= feature_config.regime_high_atr_percentile)
+            | (primary["atr_execution_pct"] > feature_config.max_atr_pct),
         ],
         ["low", "high"],
         default="medium",
@@ -3963,7 +3995,7 @@ def build_candidate_feature_frame(
         primary["mr_ema_crosses"] >= feature_config.regime_min_ema_crosses
     )
 
-    trend = resample_closed_klines(primary, source_interval, trend_interval)
+    trend = resample_closed_klines(primary, params.execution_interval, trend_interval)
     for column in ("open", "high", "low", "close", "volume"):
         trend[column] = pd.to_numeric(trend[column], errors="coerce")
     trend["trend_ema20"] = trend["close"].ewm(span=params.trend_fast_ema_period, adjust=False).mean()
@@ -4014,13 +4046,13 @@ def build_candidate_feature_frame(
 def candidate_pullback_distance_atr(row: Any, direction: str) -> Optional[float]:
     try:
         ema20 = float(row["trend_ema20"])
-        atr_15m = float(row["trend_atr_15m"])
+        atr_execution = float(row["atr_execution"])
         extreme = float(row["low"] if direction == "LONG" else row["high"])
     except (KeyError, TypeError, ValueError):
         return None
-    if not all(math.isfinite(value) for value in (ema20, atr_15m, extreme)) or atr_15m <= 0:
+    if not all(math.isfinite(value) for value in (ema20, atr_execution, extreme)) or atr_execution <= 0:
         return None
-    return abs(extreme - ema20) / atr_15m
+    return abs(extreme - ema20) / atr_execution
 
 
 def evaluate_candidate_signal(
@@ -4037,7 +4069,7 @@ def evaluate_candidate_signal(
         trend_side = int(current["trend_side"])
         persistence = int(current["trend_persistence"])
         spread_pct = float(current["trend_ema_spread_pct"])
-        atr_percentile = float(current["atr_1m_percentile"])
+        atr_percentile = float(current["atr_execution_percentile"])
         ema20 = float(current["trend_ema20"])
         close_price = float(current["close"])
         previous_high = float(previous["high"])
@@ -4140,14 +4172,35 @@ def candidate_strategy_profile(
 ) -> Tuple[float, float, int]:
     if strategy_id == CANDIDATE_MEAN_REVERSION_NAME:
         return config.stop_loss_pct, config.take_profit_pct, config.shadow_probe_max_holding_minutes
-    return params.stop_loss_pct, params.take_profit_pct, params.max_holding_minutes
+    return params.minimum_stop_loss_pct, params.minimum_take_profit_pct, params.max_holding_minutes
+
+
+def candidate_entry_risk_profile(
+    entry_price: float,
+    atr_execution: float,
+    params: CandidateReplayParameters,
+) -> Optional[Tuple[float, float]]:
+    if entry_price <= 0 or atr_execution <= 0:
+        return None
+    atr_pct = atr_execution / entry_price
+    if not math.isfinite(atr_pct) or atr_pct <= 0:
+        return None
+    stop_loss_pct = min(
+        max(atr_pct * params.stop_loss_atr_multiple, params.minimum_stop_loss_pct),
+        params.maximum_stop_loss_pct,
+    )
+    take_profit_pct = min(
+        max(atr_pct * params.take_profit_atr_multiple, params.minimum_take_profit_pct),
+        params.maximum_take_profit_pct,
+    )
+    return stop_loss_pct, take_profit_pct
 
 
 def candidate_estimated_tp_cost_ratio(config: Config, params: CandidateReplayParameters) -> float:
     round_trip_cost_pct = round_trip_execution_cost_rate(config)
-    if params.take_profit_pct <= 0:
+    if params.minimum_take_profit_pct <= 0:
         return math.inf
-    return round_trip_cost_pct / params.take_profit_pct
+    return round_trip_cost_pct / params.minimum_take_profit_pct
 
 
 def candidate_order_quantity(
@@ -4268,9 +4321,13 @@ def close_candidate_position(
         "entry_ema_slope_consistency": position["entry_ema_slope_consistency"],
         "entry_trend_persistence": position["entry_trend_persistence"],
         "entry_atr_15m": position["entry_atr_15m"],
-        "entry_atr_1m_pct": position["entry_atr_1m_pct"],
-        "entry_atr_1m_percentile": position["entry_atr_1m_percentile"],
+        "entry_execution_interval": position["entry_execution_interval"],
+        "entry_atr_execution": position["entry_atr_execution"],
+        "entry_atr_execution_pct": position["entry_atr_execution_pct"],
+        "entry_atr_execution_percentile": position["entry_atr_execution_percentile"],
         "pullback_distance_atr": position["pullback_distance_atr"],
+        "initial_stop_distance_pct": position["initial_stop_distance_pct"],
+        "initial_take_profit_distance_pct": position["initial_take_profit_distance_pct"],
         "entry_zscore": position.get("entry_zscore"),
         "gross_pnl": gross_pnl,
         "fees": fees,
@@ -4313,14 +4370,19 @@ def candidate_replay_strategy(
     sizing_mode: str = "fixed_notional",
     starting_equity_usdt: Optional[float] = None,
 ) -> Dict[str, Any]:
-    if strategy_id not in CANDIDATE_LEDGER_NAMES:
+    if strategy_id not in SUPPORTED_CANDIDATE_LEDGER_NAMES:
         raise ConfigError(f"Unsupported candidate strategy: {strategy_id}")
     if sizing_mode not in {"fixed_notional", "risk_sized"}:
         raise ConfigError(f"Unsupported candidate sizing mode: {sizing_mode}")
-    stop_loss_pct, take_profit_pct, max_holding_minutes = candidate_strategy_profile(
+    default_stop_loss_pct, default_take_profit_pct, max_holding_minutes = candidate_strategy_profile(
         strategy_id,
         config,
         params,
+    )
+    risk_config = replace(
+        config,
+        max_net_loss_per_trade_usdt=params.executable_max_net_loss_per_trade_usdt,
+        max_risk_per_trade_pct=params.executable_max_risk_per_trade_pct,
     )
     close_times = features["close_time"].astype("int64").to_numpy()
     indexes = np.flatnonzero((close_times >= segment_start_ms) & (close_times < segment_end_ms))
@@ -4340,13 +4402,27 @@ def candidate_replay_strategy(
 
         if pending is not None and int(pending["entry_index"]) == index:
             entry_price = float(row["open"])
+            if strategy_id == CANDIDATE_MEAN_REVERSION_NAME:
+                entry_risk_profile = (default_stop_loss_pct, default_take_profit_pct)
+            else:
+                entry_risk_profile = candidate_entry_risk_profile(
+                    entry_price,
+                    float(pending.get("entry_atr_execution", 0.0) or 0.0),
+                    params,
+                )
+            if entry_risk_profile is None:
+                rejection_counts["INVALID_ATR_RISK_PROFILE"] += 1
+                pending = None
+                entered_this_candle = True
+                continue
+            stop_loss_pct, take_profit_pct = entry_risk_profile
             sizing = None
             if sizing_mode == "risk_sized":
                 sizing = build_risk_sizing_plan(
                     equity,
                     entry_price,
                     filters,
-                    config,
+                    risk_config,
                     stop_loss_pct=stop_loss_pct,
                 )
                 quantity = sizing.quantity
@@ -4368,6 +4444,8 @@ def candidate_replay_strategy(
                     "quantity": quantity,
                     "stop_price": stop_price,
                     "take_profit_price": take_profit_price,
+                    "initial_stop_distance_pct": stop_loss_pct,
+                    "initial_take_profit_distance_pct": take_profit_pct,
                     "sizing_mode": sizing_mode,
                     "risk_budget_usdt": float(sizing.risk_budget_usdt if sizing is not None else 0.0),
                     "estimated_net_loss_usdt": float(
@@ -4391,6 +4469,8 @@ def candidate_replay_strategy(
             side = str(position["side"])
             stop_price = float(position["stop_price"])
             take_profit_price = float(position["take_profit_price"])
+            stop_loss_pct = float(position["initial_stop_distance_pct"])
+            take_profit_pct = float(position["initial_take_profit_distance_pct"])
             open_price = float(row["open"])
             stop_gap = open_price <= stop_price if side == "LONG" else open_price >= stop_price
             target_gap = open_price >= take_profit_price if side == "LONG" else open_price <= take_profit_price
@@ -4526,8 +4606,10 @@ def candidate_replay_strategy(
             "entry_ema_slope_consistency": slope_value,
             "entry_trend_persistence": int(row["trend_persistence"]),
             "entry_atr_15m": float(row["trend_atr_15m"]),
-            "entry_atr_1m_pct": float(row["atr_1m_pct"]),
-            "entry_atr_1m_percentile": float(row["atr_1m_percentile"]),
+            "entry_execution_interval": params.execution_interval,
+            "entry_atr_execution": float(row["atr_execution"]),
+            "entry_atr_execution_pct": float(row["atr_execution_pct"]),
+            "entry_atr_execution_percentile": float(row["atr_execution_percentile"]),
             "pullback_distance_atr": float(pullback_distance or 0.0),
             "entry_zscore": zscore_value,
         }
@@ -4681,8 +4763,12 @@ def apply_risk_sizing_overlay(
     params: CandidateReplayParameters,
     strategy_id: str,
 ) -> Dict[str, Any]:
-    stop_loss_pct, _, _ = candidate_strategy_profile(strategy_id, config, params)
     equity = float(params.starting_equity_usdt)
+    risk_config = replace(
+        config,
+        max_net_loss_per_trade_usdt=params.executable_max_net_loss_per_trade_usdt,
+        max_risk_per_trade_pct=params.executable_max_risk_per_trade_pct,
+    )
     resized: List[Dict[str, Any]] = []
     skipped: Counter = Counter()
     scale_fields = (
@@ -4699,11 +4785,16 @@ def apply_risk_sizing_overlay(
     for trade in trades:
         entry_price = float(trade.get("entry_price", 0.0) or 0.0)
         original_quantity = float(trade.get("quantity", 0.0) or 0.0)
+        fallback_stop_loss_pct, _, _ = candidate_strategy_profile(strategy_id, config, params)
+        stop_loss_pct = float(
+            trade.get("initial_stop_distance_pct", fallback_stop_loss_pct)
+            or fallback_stop_loss_pct
+        )
         sizing = build_risk_sizing_plan(
             equity,
             entry_price,
             filters,
-            config,
+            risk_config,
             stop_loss_pct=stop_loss_pct,
         )
         if sizing.quantity <= 0 or original_quantity <= 0:
@@ -4729,6 +4820,8 @@ def apply_risk_sizing_overlay(
             "sizing_mode": "risk_sized_overlay",
             "starting_equity_usdt": params.starting_equity_usdt,
             "ending_equity_usdt": equity,
+            "maximum_net_loss_per_trade_usdt": params.executable_max_net_loss_per_trade_usdt,
+            "maximum_risk_per_trade_pct": params.executable_max_risk_per_trade_pct,
             "skipped_trade_count": int(sum(skipped.values())),
             "skip_reasons": dict(sorted(skipped.items())),
             "signal_schedule_source": "fixed_notional_replay",
@@ -4949,7 +5042,12 @@ def build_walk_forward_strategy_validation(
         selection_failures.append("INSUFFICIENT_VALIDATION_TRADES")
     if validation_report.get("expectancy") is None or float(validation_report["expectancy"]) <= 0:
         selection_failures.append("NON_POSITIVE_VALIDATION_EXPECTANCY")
-    if validation_positive_windows * 2 <= validation_window_count:
+    validation_positive_fraction = (
+        validation_positive_windows / validation_window_count
+        if validation_window_count
+        else 0.0
+    )
+    if validation_positive_fraction < params.minimum_positive_window_fraction:
         selection_failures.append("VALIDATION_NOT_POSITIVE_IN_MAJORITY_OF_WINDOWS")
     if (
         validation_15x.get("net_profit_factor") is None
@@ -4962,7 +5060,8 @@ def build_walk_forward_strategy_validation(
         failures.append("STRATEGY_NOT_PRESELECTED_BY_TRAIN_AND_VALIDATION")
     if total_windows < params.minimum_walk_forward_windows:
         failures.append("INSUFFICIENT_WALK_FORWARD_WINDOWS")
-    if positive_windows * 2 <= total_windows:
+    positive_window_fraction = positive_windows / total_windows if total_windows else 0.0
+    if positive_window_fraction < params.minimum_positive_window_fraction:
         failures.append("POSITIVE_EXPECTANCY_NOT_PRESENT_IN_MAJORITY_OF_WINDOWS")
     if int(fixed_report.get("trades", 0) or 0) < params.minimum_out_of_sample_trades:
         failures.append("INSUFFICIENT_OUT_OF_SAMPLE_TRADES")
@@ -4992,6 +5091,7 @@ def build_walk_forward_strategy_validation(
             "validation_cost_stress": validation_stress,
             "validation_positive_windows": validation_positive_windows,
             "validation_window_count": validation_window_count,
+            "validation_positive_window_fraction": validation_positive_fraction,
         },
         "fixed_notional": fixed_report,
         "risk_sized": risk_report,
@@ -5000,7 +5100,7 @@ def build_walk_forward_strategy_validation(
         "walk_forward_consistency": {
             "total_test_windows": total_windows,
             "positive_expectancy_windows": positive_windows,
-            "positive_window_fraction": positive_windows / total_windows if total_windows else None,
+            "positive_window_fraction": positive_window_fraction if total_windows else None,
             "window_test_reports": list(window_reports_by_segment["test"]),
         },
         "eligible_for_micro_live_test": not failures,
@@ -5030,11 +5130,14 @@ def run_candidate_replay(
     end_exclusive_ms = aligned_replay_end_ms(config.interval, end_time)
     windows = rolling_walk_forward_boundaries(days, end_exclusive_ms, params)
     source_seconds = interval_seconds(config.interval)
+    execution_seconds = interval_seconds(params.execution_interval)
     trend_seconds = interval_seconds(config.trend_interval)
-    if source_seconds is None or trend_seconds is None:
+    if source_seconds is None or execution_seconds is None or trend_seconds is None:
         raise ConfigError("Candidate replay intervals are invalid")
+    if execution_seconds % source_seconds != 0 or trend_seconds % execution_seconds != 0:
+        raise ConfigError("Candidate replay intervals must be exact multiples of each other")
     warmup_ms = max(
-        params.atr_percentile_window * source_seconds,
+        params.atr_percentile_window * execution_seconds,
         (params.trend_slow_ema_period + params.slope_consistency_window + params.trend_atr_period) * trend_seconds,
     ) * 1000
     download_start_ms = int(windows[0]["train"][0]) - warmup_ms - 2 * trend_seconds * 1000
@@ -5194,26 +5297,28 @@ def run_candidate_replay(
         else "NOT_VIABLE_OR_INSUFFICIENT_OUT_OF_SAMPLE_EVIDENCE"
     )
     summary = {
-        "engine": "independent_strategy_rolling_walk_forward_v2",
+        "engine": "trend_pullback_5m_15m_rolling_walk_forward_v3",
         "generated_at": utc_now_text(),
         "run_id": run_id,
         "strategies": list(CANDIDATE_LEDGER_NAMES),
+        "legacy_strategies_frozen": list(LEGACY_CANDIDATE_LEDGER_NAMES),
         "symbol": config.symbol,
-        "interval": config.interval,
+        "source_interval": config.interval,
+        "execution_interval": params.execution_interval,
         "trend_interval": config.trend_interval,
         "days": days,
         "shadow_mode_only": True,
         "dry_run": True,
         "live_trading": False,
         "account_state_changed": False,
-        "forward_shadow_execution_changed": False,
+        "forward_shadow_execution_enabled": config.forward_shadow_execution_enabled,
         "ui_changed": False,
         "strategy_parameters_frozen": True,
         "continuous_master_replay_per_strategy": True,
         "master_replay_count": len(CANDIDATE_LEDGER_NAMES),
         "window_metrics_are_sliced_from_master_replays": True,
-        "fixed_notional_view_purpose": "strategy_edge_validation",
-        "risk_sized_view_purpose": "exchange_feasibility_and_account_risk_validation",
+        "fixed_notional_view_purpose": "normalized_strategy_edge_validation",
+        "risk_sized_view_purpose": "five_usdt_exchange_feasibility_and_account_risk_validation",
         "source_sha256": file_sha256(Path(__file__).resolve()),
         "cache_file": str(cache_path),
         "cache_sha256": file_sha256(cache_path),
@@ -6673,6 +6778,10 @@ def log_startup(config: Config) -> None:
     LOGGER.info("Symbol=%s interval=%s lookback=%s", config.symbol, config.interval, config.lookback)
     LOGGER.info("Active strategies=%s", ",".join(config.active_strategies))
     LOGGER.info("Active execution controller=%s", ACTIVE_STRATEGY)
+    LOGGER.info(
+        "Forward shadow execution enabled=%s",
+        config.forward_shadow_execution_enabled,
+    )
     LOGGER.info("Logging-only strategies=%s", ",".join(LOGGING_ONLY_STRATEGIES))
     LOGGER.info("DRY_RUN=%s TESTNET=%s LIVE_TRADING=%s SHADOW_MODE=%s", config.dry_run, config.testnet, config.live_trading, config.shadow_mode)
     LOGGER.info(

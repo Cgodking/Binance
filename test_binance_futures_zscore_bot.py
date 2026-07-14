@@ -28,6 +28,7 @@ class EnvTestCase(unittest.TestCase):
                 "TESTNET",
                 "LIVE_TRADING",
                 "SHADOW_MODE",
+                "FORWARD_SHADOW_EXECUTION_ENABLED",
                 "SYMBOL",
                 "INTERVAL",
                 "LOOKBACK",
@@ -123,6 +124,7 @@ class EliteStrategyConfigTests(EnvTestCase):
         self.assertEqual(config.regime_slow_ema_period, 50)
         self.assertEqual(config.breakout_lookback, 20)
         self.assertEqual(config.exchange_filters_cache_file, "exchange_filters_cache.json")
+        self.assertFalse(config.forward_shadow_execution_enabled)
         self.assertFalse(config.market_gate_enforced)
         self.assertEqual(config.regime_stability_window, 20)
         self.assertEqual(config.min_regime_persistence_candles, 10)
@@ -683,6 +685,7 @@ class EliteShadowRuntimeTests(EnvTestCase):
             max_risk_per_trade_pct=0.10,
             max_margin_usdt=10.0,
             max_notional_usdt=10.0,
+            forward_shadow_execution_enabled=True,
         )
         self.filters = self.module.ExchangeFilters(
             step_size=0.01,
@@ -692,6 +695,35 @@ class EliteShadowRuntimeTests(EnvTestCase):
             min_notional=5.0,
             quantity_precision=2,
             price_precision=4,
+        )
+
+    def test_forward_shadow_execution_is_blocked_during_research_phase(self):
+        state = self.module.RuntimeState(persist_events=False)
+        state.balance = 100.0
+        research_only = self.module.replace(
+            self.config,
+            forward_shadow_execution_enabled=False,
+        )
+        decision = self.module.evaluate_elite_signal(
+            research_only,
+            timestamp="2026-06-14 00:00 UTC",
+            close_price=68.2,
+            previous_close=68.0,
+            zscore=-2.4,
+            previous_zscore=-2.62,
+            atr_pct=0.0005,
+            atr_bucket="medium",
+            trend_bucket="medium",
+            trend_slope_pct=0.003,
+        )
+
+        state.process_elite_signal(research_only, decision, self.filters)
+
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["shadow"]["open_position_count"], 0)
+        self.assertEqual(
+            snapshot["shadow"]["latest_signal"]["rejection_reason"],
+            "FORWARD_SHADOW_EXECUTION_DISABLED",
         )
 
     def test_signal_logging_writes_jsonl_and_csv_for_every_evaluation(self):
@@ -871,6 +903,7 @@ class EliteShadowRuntimeTests(EnvTestCase):
             max_risk_per_trade_pct=0.10,
             max_margin_usdt=10.0,
             max_notional_usdt=10.0,
+            forward_shadow_execution_enabled=True,
         )
         state = self.module.RuntimeState()
         state.balance = 100.0
@@ -1096,6 +1129,7 @@ class EliteShadowRuntimeTests(EnvTestCase):
             max_risk_per_trade_pct=0.10,
             max_margin_usdt=10.0,
             max_notional_usdt=10.0,
+            forward_shadow_execution_enabled=True,
         )
         state = self.module.RuntimeState()
         state.balance = 100.0
@@ -1421,7 +1455,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             price_precision=2,
         )
 
-    def _signal_rows(self, atr_15m):
+    def _signal_rows(self, atr_execution):
         previous = {
             "open_time": 0,
             "close_time": 59999,
@@ -1432,7 +1466,10 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             "trend_feature_close_time": 59999,
             "trend_ema20": 100.0,
             "trend_ema50": 99.0,
-            "trend_atr_15m": atr_15m,
+            "trend_atr_15m": 2.0,
+            "atr_execution": atr_execution,
+            "atr_execution_pct": atr_execution / 100.8,
+            "atr_execution_percentile": 0.5,
         }
         current = {
             "open_time": 60000,
@@ -1444,35 +1481,61 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             "trend_feature_close_time": 119999,
             "trend_ema20": 100.0,
             "trend_ema50": 99.0,
-            "trend_atr_15m": atr_15m,
+            "trend_atr_15m": 2.0,
             "trend_ema_spread_pct": 0.01,
             "trend_side": 1,
             "trend_persistence": 5,
             "long_slope_consistency": 1.0,
             "short_slope_consistency": 0.0,
-            "atr_1m_pct": 0.002,
-            "atr_1m_percentile": 0.5,
+            "atr_execution": atr_execution,
+            "atr_execution_pct": atr_execution / 101.5,
+            "atr_execution_percentile": 0.5,
         }
         return current, previous
 
     def test_pullback_distance_scales_with_atr_instead_of_fixed_percentage(self):
-        current, previous = self._signal_rows(2.0)
+        current, previous = self._signal_rows(0.9)
         accepted, reason, distance = self.module.evaluate_candidate_signal(
             current, previous, "LONG", self.params
         )
 
         self.assertTrue(accepted)
         self.assertEqual(reason, "")
-        self.assertAlmostEqual(distance, 0.3)
+        self.assertAlmostEqual(distance, 2.0 / 3.0)
 
-        current, previous = self._signal_rows(1.0)
+        current, previous = self._signal_rows(0.5)
         accepted, reason, distance = self.module.evaluate_candidate_signal(
             current, previous, "LONG", self.params
         )
 
         self.assertFalse(accepted)
         self.assertEqual(reason, "PULLBACK_OUTSIDE_ATR_BAND")
-        self.assertAlmostEqual(distance, 0.6)
+        self.assertAlmostEqual(distance, 1.2)
+
+    def test_atr_entry_risk_profile_is_dynamic_and_bounded(self):
+        regular = self.module.candidate_entry_risk_profile(100.0, 0.4, self.params)
+        quiet = self.module.candidate_entry_risk_profile(100.0, 0.1, self.params)
+        volatile = self.module.candidate_entry_risk_profile(100.0, 2.0, self.params)
+
+        self.assertEqual(regular, (0.006, 0.012))
+        self.assertEqual(
+            quiet,
+            (self.params.minimum_stop_loss_pct, self.params.minimum_take_profit_pct),
+        )
+        self.assertEqual(
+            volatile,
+            (self.params.maximum_stop_loss_pct, self.params.maximum_take_profit_pct),
+        )
+
+    def test_mean_reversion_is_frozen_outside_active_candidate_ledgers(self):
+        self.assertNotIn(
+            self.module.CANDIDATE_MEAN_REVERSION_NAME,
+            self.module.CANDIDATE_LEDGER_NAMES,
+        )
+        self.assertIn(
+            self.module.CANDIDATE_MEAN_REVERSION_NAME,
+            self.module.LEGACY_CANDIDATE_LEDGER_NAMES,
+        )
 
     def test_long_and_short_excursions_use_independent_direction_formulas(self):
         long_mfe, long_mae = self.module.candidate_excursion_pct("LONG", 100.0, 105.0, 98.0)
@@ -1491,7 +1554,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
                 "open_time": 120000,
                 "close_time": 179999,
                 "open": 102.0,
-                "high": 104.0,
+                "high": 105.0,
                 "low": 101.8,
                 "close": 103.5,
                 "trend_feature_close_time": 179999,
@@ -1525,7 +1588,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         trade = result["trades"][0]
         self.assertEqual(trade["entry_price"], 102.0)
         self.assertEqual(trade["exit_reason"], "TAKE_PROFIT")
-        self.assertAlmostEqual(trade["mfe_pct"], self.params.take_profit_pct)
+        self.assertAlmostEqual(trade["mfe_pct"], trade["initial_take_profit_distance_pct"])
         self.assertEqual(trade["mae_pct"], 0.0)
         self.assertGreater(trade["fees"], 0.0)
         self.assertGreater(trade["slippage"], 0.0)
@@ -1589,6 +1652,8 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         features = self.module.build_candidate_feature_frame(frame, self.params)
         available = features.dropna(subset=["trend_feature_close_time"])
 
+        self.assertTrue((features["open_time"] % (5 * 60 * 1000) == 0).all())
+        self.assertEqual(len(features), 240)
         self.assertTrue((available["trend_feature_close_time"] <= available["close_time"]).all())
 
     def test_candidate_replay_refuses_any_non_shadow_safety_configuration(self):
@@ -1606,16 +1671,16 @@ class CostAwareCandidateReplayTests(EnvTestCase):
     def test_candidate_cost_gate_matches_fee_and_slippage_assumptions(self):
         ratio = self.module.candidate_estimated_tp_cost_ratio(self.config, self.params)
 
-        self.assertAlmostEqual(ratio, 0.16)
-        self.assertLess(ratio, self.params.maximum_tp_cost_ratio)
+        self.assertAlmostEqual(ratio, 0.20)
+        self.assertLessEqual(ratio, self.params.maximum_tp_cost_ratio)
 
-    def test_rolling_walk_forward_uses_six_recent_windows_and_embargo(self):
+    def test_rolling_walk_forward_uses_fifteen_recent_windows_and_embargo(self):
         day_ms = 24 * 60 * 60 * 1000
         end_ms = 1000 * day_ms
 
         windows = self.module.rolling_walk_forward_boundaries(600, end_ms, self.params)
 
-        self.assertEqual(len(windows), 6)
+        self.assertEqual(len(windows), 15)
         self.assertEqual(windows[-1]["test"][1], end_ms)
         embargo_ms = self.params.embargo_minutes * 60 * 1000
         for window in windows:
@@ -1668,7 +1733,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertTrue(trade["gap_exit"])
         self.assertLess(trade["net_pnl"], -0.1)
 
-    def test_risk_overlay_rejects_exchange_minimum_above_budget(self):
+    def test_five_usdt_risk_overlay_accepts_order_within_research_budget(self):
         source_trade = {
             "strategy_id": self.module.CANDIDATE_TREND_LONG_NAME,
             "entry_price": 65.0,
@@ -1692,6 +1757,41 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             self.filters,
             self.config,
             self.params,
+            self.module.CANDIDATE_TREND_LONG_NAME,
+        )
+
+        self.assertEqual(result["report"]["trades"], 1)
+        self.assertEqual(result["report"]["starting_equity_usdt"], 5.0)
+        self.assertEqual(result["report"]["maximum_net_loss_per_trade_usdt"], 0.04)
+        self.assertLessEqual(result["trades"][0]["estimated_net_loss_usdt"], 0.04)
+
+    def test_five_usdt_risk_overlay_still_rejects_when_research_cap_is_too_low(self):
+        source_trade = {
+            "strategy_id": self.module.CANDIDATE_TREND_LONG_NAME,
+            "entry_price": 65.0,
+            "exit_price": 65.5,
+            "quantity": 0.154,
+            "gross_pnl": 0.077,
+            "fees": 0.01,
+            "slippage": 0.004,
+            "spread_cost": 0.002,
+            "funding_pnl": 0.0,
+            "execution_cost": 0.016,
+            "net_pnl": 0.061,
+            "mfe_usdt": 0.1,
+            "mae_usdt": 0.02,
+            "initial_stop_distance_pct": 0.0035,
+        }
+        constrained = self.module.replace(
+            self.params,
+            executable_max_net_loss_per_trade_usdt=0.02,
+        )
+
+        result = self.module.apply_risk_sizing_overlay(
+            [source_trade],
+            self.filters,
+            self.config,
+            constrained,
             self.module.CANDIDATE_TREND_LONG_NAME,
         )
 
@@ -1881,7 +1981,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
                     params=params,
                 )
 
-            self.assertEqual(summary["engine"], "independent_strategy_rolling_walk_forward_v2")
+            self.assertEqual(summary["engine"], "trend_pullback_5m_15m_rolling_walk_forward_v3")
             self.assertEqual(summary["walk_forward"]["window_count"], 1)
             self.assertEqual(
                 set(summary["out_of_sample_validation"]),

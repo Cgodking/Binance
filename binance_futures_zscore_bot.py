@@ -51,10 +51,12 @@ CANDIDATE_STRATEGY_NAME = "COST_AWARE_STABLE_TREND_PULLBACK"
 CANDIDATE_PROFILE_V3 = "v3_5m_15m"
 CANDIDATE_PROFILE_V4 = "v4_15m_1h"
 CANDIDATE_PROFILE_V5 = "v5_30m_2h"
+CANDIDATE_PROFILE_V6 = "v6_long_cost_gate_30m_2h"
 CANDIDATE_REPLAY_PROFILES = (
     CANDIDATE_PROFILE_V3,
     CANDIDATE_PROFILE_V4,
     CANDIDATE_PROFILE_V5,
+    CANDIDATE_PROFILE_V6,
 )
 CANDIDATE_DIRECTIONS = ("LONG", "SHORT")
 CANDIDATE_TREND_LONG_NAME = "TREND_PULLBACK_LONG"
@@ -338,8 +340,10 @@ class CandidateReplayParameters:
     profile_name: str = CANDIDATE_PROFILE_V4
     engine_name: str = "trend_pullback_15m_1h_rolling_walk_forward_v4"
     default_replay_days: int = 600
+    source_interval: str = "1m"
     execution_interval: str = "15m"
     trend_interval: str = "1h"
+    strategy_ids: Tuple[str, ...] = CANDIDATE_LEDGER_NAMES
     trend_fast_ema_period: int = 20
     trend_slow_ema_period: int = 50
     trend_atr_period: int = 14
@@ -380,6 +384,13 @@ class CandidateReplayParameters:
     maximum_drawdown_usdt: float = 0.20
     maximum_cost_to_gross_profit_ratio: float = 0.30
     requires_fresh_forward_validation: bool = True
+    train_cost_gate_enabled: bool = False
+    cost_gate_stress_multiplier: float = 1.50
+    cost_gate_min_bucket_trades: int = 30
+    cost_gate_min_validation_trades: int = 20
+    cost_gate_min_net_profit_factor: float = 1.15
+    minimum_risk_sized_coverage: float = 0.0
+    minimum_cross_symbol_qualified_fraction: float = 0.75
 
 
 def candidate_replay_parameters_for_profile(profile_name: str) -> CandidateReplayParameters:
@@ -428,6 +439,18 @@ def candidate_replay_parameters_for_profile(profile_name: str) -> CandidateRepla
             walk_forward_test_days=90,
             walk_forward_step_days=90,
             embargo_minutes=960,
+        )
+    if normalized == CANDIDATE_PROFILE_V6:
+        v5 = candidate_replay_parameters_for_profile(CANDIDATE_PROFILE_V5)
+        return replace(
+            v5,
+            profile_name=CANDIDATE_PROFILE_V6,
+            engine_name="long_cost_gate_30m_2h_rolling_walk_forward_v6",
+            source_interval="30m",
+            strategy_ids=(CANDIDATE_TREND_LONG_NAME,),
+            fixed_notional_usdt=100.0,
+            train_cost_gate_enabled=True,
+            minimum_risk_sized_coverage=0.50,
         )
     raise ConfigError(f"Unsupported candidate replay profile: {profile_name}")
 
@@ -4753,6 +4776,36 @@ def candidate_distribution(values: Sequence[float]) -> Dict[str, Optional[float]
     }
 
 
+def apply_candidate_cost_stress(
+    trades: Sequence[Dict[str, Any]],
+    multiplier_value: float,
+) -> List[Dict[str, Any]]:
+    multiplier = float(multiplier_value)
+    if multiplier <= 0:
+        raise ConfigError("Cost stress multipliers must be positive")
+    stressed: List[Dict[str, Any]] = []
+    for trade in trades:
+        fees = float(trade.get("fees", 0.0) or 0.0) * multiplier
+        slippage = float(trade.get("slippage", 0.0) or 0.0) * multiplier
+        spread_cost = float(trade.get("spread_cost", 0.0) or 0.0) * multiplier
+        funding_pnl = float(trade.get("funding_pnl", 0.0) or 0.0)
+        gross_pnl = float(trade.get("gross_pnl", 0.0) or 0.0)
+        execution_cost = fees + slippage + spread_cost
+        net_pnl = gross_pnl + funding_pnl - execution_cost
+        stressed.append(
+            {
+                **trade,
+                "fees": fees,
+                "slippage": slippage,
+                "spread_cost": spread_cost,
+                "execution_cost": execution_cost,
+                "net_pnl": net_pnl,
+                "result": "WIN" if net_pnl > 0 else "LOSS",
+            }
+        )
+    return stressed
+
+
 def build_cost_stress_report(
     trades: Sequence[Dict[str, Any]],
     multipliers: Sequence[float],
@@ -4760,28 +4813,7 @@ def build_cost_stress_report(
     reports: Dict[str, Dict[str, Any]] = {}
     for multiplier_value in multipliers:
         multiplier = float(multiplier_value)
-        if multiplier <= 0:
-            raise ConfigError("Cost stress multipliers must be positive")
-        stressed: List[Dict[str, Any]] = []
-        for trade in trades:
-            fees = float(trade.get("fees", 0.0) or 0.0) * multiplier
-            slippage = float(trade.get("slippage", 0.0) or 0.0) * multiplier
-            spread_cost = float(trade.get("spread_cost", 0.0) or 0.0) * multiplier
-            funding_pnl = float(trade.get("funding_pnl", 0.0) or 0.0)
-            gross_pnl = float(trade.get("gross_pnl", 0.0) or 0.0)
-            execution_cost = fees + slippage + spread_cost
-            net_pnl = gross_pnl + funding_pnl - execution_cost
-            stressed.append(
-                {
-                    **trade,
-                    "fees": fees,
-                    "slippage": slippage,
-                    "spread_cost": spread_cost,
-                    "execution_cost": execution_cost,
-                    "net_pnl": net_pnl,
-                    "result": "WIN" if net_pnl > 0 else "LOSS",
-                }
-            )
+        stressed = apply_candidate_cost_stress(trades, multiplier)
         report = summarize_trade_group(stressed)
         report["cost_multiplier"] = multiplier
         reports[f"{multiplier:g}x"] = report
@@ -4817,6 +4849,172 @@ def block_bootstrap_expectancy(
         "lower_95": float(np.quantile(means, 0.025)),
         "median": float(np.quantile(means, 0.50)),
         "upper_95": float(np.quantile(means, 0.975)),
+    }
+
+
+def candidate_cost_gate_labels(trade: Dict[str, Any]) -> Dict[str, str]:
+    def finite_value(field_name: str) -> Optional[float]:
+        try:
+            value = float(trade.get(field_name))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    atr_percentile = finite_value("entry_atr_execution_percentile")
+    ema_spread = finite_value("entry_ema_spread_pct")
+    pullback_distance = finite_value("pullback_distance_atr")
+    slope_consistency = finite_value("entry_ema_slope_consistency")
+    return {
+        "atr_percentile": (
+            "low"
+            if atr_percentile is not None and atr_percentile <= 0.33
+            else "medium"
+            if atr_percentile is not None and atr_percentile <= 0.66
+            else "high"
+            if atr_percentile is not None
+            else "unknown"
+        ),
+        "ema_spread": (
+            "narrow"
+            if ema_spread is not None and ema_spread < 0.004
+            else "medium"
+            if ema_spread is not None and ema_spread < 0.008
+            else "wide"
+            if ema_spread is not None
+            else "unknown"
+        ),
+        "pullback_distance": (
+            "shallow"
+            if pullback_distance is not None and pullback_distance <= 0.35
+            else "balanced"
+            if pullback_distance is not None and pullback_distance <= 0.55
+            else "deep"
+            if pullback_distance is not None
+            else "unknown"
+        ),
+        "slope_consistency": (
+            "baseline"
+            if slope_consistency is not None and slope_consistency < 0.90
+            else "strong"
+            if slope_consistency is not None and slope_consistency < 0.999999
+            else "perfect"
+            if slope_consistency is not None
+            else "unknown"
+        ),
+    }
+
+
+def fit_candidate_train_cost_gate(
+    train_trades: Sequence[Dict[str, Any]],
+    params: CandidateReplayParameters,
+) -> Dict[str, Any]:
+    dimensions = ("atr_percentile", "ema_spread", "pullback_distance", "slope_consistency")
+    labels_by_trade = [(trade, candidate_cost_gate_labels(trade)) for trade in train_trades]
+    dimension_reports: Dict[str, Dict[str, Any]] = {}
+    allowed_labels: Dict[str, List[str]] = {}
+    for dimension_index, dimension in enumerate(dimensions):
+        observed_labels = sorted({labels[dimension] for _, labels in labels_by_trade})
+        bucket_reports: Dict[str, Any] = {}
+        accepted: List[str] = []
+        for label_index, label in enumerate(observed_labels):
+            bucket_trades = [trade for trade, labels in labels_by_trade if labels[dimension] == label]
+            stressed = apply_candidate_cost_stress(bucket_trades, params.cost_gate_stress_multiplier)
+            report = summarize_trade_group(stressed)
+            bootstrap = block_bootstrap_expectancy(
+                stressed,
+                params.bootstrap_samples,
+                params.bootstrap_block_trades,
+                seed=20260714 + dimension_index * 100 + label_index,
+            )
+            failures: List[str] = []
+            if label == "unknown":
+                failures.append("UNKNOWN_BUCKET")
+            if len(bucket_trades) < params.cost_gate_min_bucket_trades:
+                failures.append("INSUFFICIENT_TRAIN_BUCKET_TRADES")
+            if report.get("expectancy") is None or float(report["expectancy"]) <= 0:
+                failures.append("NON_POSITIVE_STRESSED_EXPECTANCY")
+            if (
+                report.get("net_profit_factor") is None
+                or float(report["net_profit_factor"]) <= params.cost_gate_min_net_profit_factor
+            ):
+                failures.append("STRESSED_NET_PROFIT_FACTOR_BELOW_THRESHOLD")
+            if bootstrap.get("lower_95") is None or float(bootstrap["lower_95"]) <= 0:
+                failures.append("STRESSED_BOOTSTRAP_LOWER_BOUND_NOT_POSITIVE")
+            eligible = not failures
+            if eligible:
+                accepted.append(label)
+            bucket_reports[label] = {
+                "eligible": eligible,
+                "failure_reasons": failures,
+                "stressed_report": report,
+                "stressed_bootstrap": bootstrap,
+            }
+        allowed_labels[dimension] = accepted
+        dimension_reports[dimension] = bucket_reports
+    gate_usable = all(allowed_labels[dimension] for dimension in dimensions)
+    return {
+        "gate_usable": gate_usable,
+        "training_trade_count": len(train_trades),
+        "stress_multiplier": params.cost_gate_stress_multiplier,
+        "minimum_bucket_trades": params.cost_gate_min_bucket_trades,
+        "minimum_net_profit_factor": params.cost_gate_min_net_profit_factor,
+        "allowed_labels": allowed_labels,
+        "dimension_reports": dimension_reports,
+        "bucket_definitions_frozen": True,
+    }
+
+
+def filter_candidate_trades_by_cost_gate(
+    trades: Sequence[Dict[str, Any]],
+    gate: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not bool(gate.get("gate_usable")):
+        return []
+    allowed_labels = gate.get("allowed_labels", {})
+    filtered: List[Dict[str, Any]] = []
+    for trade in trades:
+        labels = candidate_cost_gate_labels(trade)
+        if all(labels.get(dimension) in set(values) for dimension, values in allowed_labels.items()):
+            filtered.append(dict(trade))
+    return filtered
+
+
+def validate_candidate_train_cost_gate(
+    validation_trades: Sequence[Dict[str, Any]],
+    gate: Dict[str, Any],
+    params: CandidateReplayParameters,
+) -> Dict[str, Any]:
+    filtered = filter_candidate_trades_by_cost_gate(validation_trades, gate)
+    stressed = apply_candidate_cost_stress(filtered, params.cost_gate_stress_multiplier)
+    report = summarize_trade_group(stressed)
+    bootstrap = block_bootstrap_expectancy(
+        stressed,
+        params.bootstrap_samples,
+        params.bootstrap_block_trades,
+        seed=20260715,
+    )
+    failures: List[str] = []
+    if not bool(gate.get("gate_usable")):
+        failures.append("TRAIN_COST_GATE_NOT_USABLE")
+    if len(filtered) < params.cost_gate_min_validation_trades:
+        failures.append("INSUFFICIENT_GATED_VALIDATION_TRADES")
+    if report.get("expectancy") is None or float(report["expectancy"]) <= 0:
+        failures.append("NON_POSITIVE_GATED_VALIDATION_EXPECTANCY")
+    if (
+        report.get("net_profit_factor") is None
+        or float(report["net_profit_factor"]) <= params.cost_gate_min_net_profit_factor
+    ):
+        failures.append("GATED_VALIDATION_NET_PROFIT_FACTOR_BELOW_THRESHOLD")
+    if bootstrap.get("lower_95") is None or float(bootstrap["lower_95"]) <= 0:
+        failures.append("GATED_VALIDATION_BOOTSTRAP_LOWER_BOUND_NOT_POSITIVE")
+    return {
+        "eligible": not failures,
+        "failure_reasons": failures,
+        "raw_trade_count": len(validation_trades),
+        "gated_trade_count": len(filtered),
+        "stressed_report": report,
+        "stressed_bootstrap": bootstrap,
+        "gated_trades": filtered,
     }
 
 
@@ -4878,6 +5076,8 @@ def apply_risk_sizing_overlay(
         resized.append(resized_trade)
         equity += float(resized_trade["net_pnl"])
     report = build_candidate_direction_report(resized, params.minimum_out_of_sample_trades, params)
+    total_signals = len(resized) + int(sum(skipped.values()))
+    execution_coverage = len(resized) / total_signals if total_signals else 0.0
     report.update(
         {
             "strategy_id": strategy_id,
@@ -4887,6 +5087,8 @@ def apply_risk_sizing_overlay(
             "maximum_net_loss_per_trade_usdt": params.executable_max_net_loss_per_trade_usdt,
             "maximum_risk_per_trade_pct": params.executable_max_risk_per_trade_pct,
             "skipped_trade_count": int(sum(skipped.values())),
+            "source_signal_count": total_signals,
+            "execution_coverage": execution_coverage,
             "skip_reasons": dict(sorted(skipped.items())),
             "signal_schedule_source": "fixed_notional_replay",
         }
@@ -5145,6 +5347,12 @@ def build_walk_forward_strategy_validation(
         failures.append("NO_RISK_SIZED_ORDERS_FIT_EXCHANGE_FILTERS")
     elif float(risk_report.get("net_pnl", 0.0) or 0.0) <= 0:
         failures.append("NON_POSITIVE_RISK_SIZED_NET_PNL")
+    if (
+        params.minimum_risk_sized_coverage > 0
+        and float(risk_report.get("execution_coverage", 0.0) or 0.0)
+        < params.minimum_risk_sized_coverage
+    ):
+        failures.append("RISK_SIZED_EXECUTION_COVERAGE_BELOW_THRESHOLD")
     historical_gate_passed = not failures
     return {
         "strategy_id": strategy_id,
@@ -5195,9 +5403,11 @@ def run_candidate_replay(
             f"above the {params.maximum_tp_cost_ratio:.6f} limit"
         )
 
-    end_exclusive_ms = aligned_replay_end_ms(config.interval, end_time)
+    source_interval = params.source_interval
+    market_data_config = replace(config, interval=source_interval)
+    end_exclusive_ms = aligned_replay_end_ms(source_interval, end_time)
     windows = rolling_walk_forward_boundaries(days, end_exclusive_ms, params)
-    source_seconds = interval_seconds(config.interval)
+    source_seconds = interval_seconds(source_interval)
     execution_seconds = interval_seconds(params.execution_interval)
     trend_seconds = interval_seconds(params.trend_interval)
     if source_seconds is None or execution_seconds is None or trend_seconds is None:
@@ -5218,7 +5428,7 @@ def run_candidate_replay(
     filters = get_exchange_filters(client, config.symbol, config)
     all_klines = ensure_historical_kline_cache(
         client,
-        config,
+        market_data_config,
         download_start_ms,
         end_exclusive_ms - 1,
         cache_path,
@@ -5233,7 +5443,7 @@ def run_candidate_replay(
     features = build_candidate_feature_frame(
         all_klines,
         params,
-        config.interval,
+        source_interval,
         params.trend_interval,
         config=config,
     )
@@ -5241,7 +5451,7 @@ def run_candidate_replay(
     run_dir = output_dir / "runs" / run_id
     master_start_ms = int(windows[0]["train"][0])
     master_results: Dict[str, Dict[str, Any]] = {}
-    for strategy_id in CANDIDATE_LEDGER_NAMES:
+    for strategy_id in params.strategy_ids:
         LOGGER.info("Candidate continuous master replay started strategy=%s", strategy_id)
         master_results[strategy_id] = candidate_replay_strategy(
             config,
@@ -5260,11 +5470,15 @@ def run_candidate_replay(
     feature_close_times = features["close_time"].astype("int64").to_numpy()
     aggregate_fixed: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
         strategy_id: {segment: [] for segment in ("train", "validation", "test")}
-        for strategy_id in CANDIDATE_LEDGER_NAMES
+        for strategy_id in params.strategy_ids
+    }
+    aggregate_raw: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        strategy_id: {segment: [] for segment in ("train", "validation", "test")}
+        for strategy_id in params.strategy_ids
     }
     window_reports: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
         strategy_id: {segment: [] for segment in ("train", "validation", "test")}
-        for strategy_id in CANDIDATE_LEDGER_NAMES
+        for strategy_id in params.strategy_ids
     }
     window_summaries: List[Dict[str, Any]] = []
 
@@ -5283,8 +5497,9 @@ def run_candidate_replay(
                 "start": candle_time_text(start_ms),
                 "end_exclusive": candle_time_text(end_ms),
             }
-        for strategy_id in CANDIDATE_LEDGER_NAMES:
+        for strategy_id in params.strategy_ids:
             strategy_summary: Dict[str, Any] = {}
+            raw_results: Dict[str, Dict[str, Any]] = {}
             for segment_name in ("train", "validation", "test"):
                 start_ms, end_ms = window[segment_name]
                 evaluated_candles = int(
@@ -5292,7 +5507,7 @@ def run_candidate_replay(
                         (feature_close_times >= start_ms) & (feature_close_times < end_ms)
                     )
                 )
-                fixed_result = slice_candidate_replay_result(
+                raw_results[segment_name] = slice_candidate_replay_result(
                     master_results[strategy_id],
                     strategy_id,
                     start_ms,
@@ -5300,34 +5515,108 @@ def run_candidate_replay(
                     params,
                     evaluated_candles,
                 )
+
+            selected_trades = {
+                segment_name: list(raw_results[segment_name]["trades"])
+                for segment_name in ("train", "validation", "test")
+            }
+            cost_gate_summary: Dict[str, Any] = {"enabled": False}
+            if params.train_cost_gate_enabled:
+                train_gate = fit_candidate_train_cost_gate(selected_trades["train"], params)
+                gated_train = filter_candidate_trades_by_cost_gate(selected_trades["train"], train_gate)
+                validation_gate = validate_candidate_train_cost_gate(
+                    selected_trades["validation"],
+                    train_gate,
+                    params,
+                )
+                gated_validation = list(validation_gate.pop("gated_trades"))
+                gated_test = (
+                    filter_candidate_trades_by_cost_gate(selected_trades["test"], train_gate)
+                    if bool(validation_gate["eligible"])
+                    else []
+                )
+                selected_trades = {
+                    "train": gated_train,
+                    "validation": gated_validation,
+                    "test": gated_test,
+                }
+                cost_gate_summary = {
+                    "enabled": True,
+                    "selection_source": "TRAIN_ONLY",
+                    "validation_source": "VALIDATION_ONLY",
+                    "test_data_used_for_selection": False,
+                    "train_gate": train_gate,
+                    "validation_gate": validation_gate,
+                    "test_evaluation_authorized": bool(validation_gate["eligible"]),
+                    "raw_test_trade_count": len(raw_results["test"]["trades"]),
+                    "gated_test_trade_count": len(gated_test),
+                }
+
+            for segment_name in ("train", "validation", "test"):
+                start_ms, end_ms = window[segment_name]
+                minimum_trades = (
+                    params.minimum_train_trades
+                    if segment_name == "train"
+                    else params.minimum_out_of_sample_trades
+                )
+                fixed_report = build_candidate_direction_report(
+                    selected_trades[segment_name],
+                    minimum_trades,
+                    params,
+                )
+                fixed_report.update(
+                    {
+                        "strategy_id": strategy_id,
+                        "segment_start": candle_time_text(start_ms),
+                        "segment_end_exclusive": candle_time_text(end_ms),
+                        "evaluated_candles": raw_results[segment_name]["report"].get(
+                            "evaluated_candles", 0
+                        ),
+                        "raw_trade_count": len(raw_results[segment_name]["trades"]),
+                        "train_cost_gate_applied": params.train_cost_gate_enabled,
+                    }
+                )
                 risk_result = apply_risk_sizing_overlay(
-                    fixed_result["trades"],
+                    selected_trades[segment_name],
                     filters,
                     config,
                     params,
                     strategy_id,
                 )
                 strategy_summary[segment_name] = {
-                    "fixed_notional": fixed_result["report"],
+                    "fixed_notional": fixed_report,
                     "risk_sized": risk_result["report"],
                 }
+                if params.train_cost_gate_enabled:
+                    write_candidate_trades(
+                        run_dir / window_id / f"{strategy_id.lower()}_{segment_name}_raw.csv",
+                        raw_results[segment_name]["trades"],
+                    )
                 write_candidate_trades(
                     run_dir / window_id / f"{strategy_id.lower()}_{segment_name}_fixed.csv",
-                    fixed_result["trades"],
+                    selected_trades[segment_name],
                 )
                 write_candidate_trades(
                     run_dir / window_id / f"{strategy_id.lower()}_{segment_name}_risk.csv",
                     risk_result["trades"],
                 )
-                aggregate_fixed[strategy_id][segment_name].extend(fixed_result["trades"])
-                window_reports[strategy_id][segment_name].append(fixed_result["report"])
+                aggregate_fixed[strategy_id][segment_name].extend(selected_trades[segment_name])
+                aggregate_raw[strategy_id][segment_name].extend(
+                    raw_results[segment_name]["trades"]
+                )
+                window_reports[strategy_id][segment_name].append(fixed_report)
+            strategy_summary["cost_gate"] = cost_gate_summary
             window_summary["strategies"][strategy_id] = strategy_summary
         window_summaries.append(window_summary)
 
     validation: Dict[str, Dict[str, Any]] = {}
-    for strategy_id in CANDIDATE_LEDGER_NAMES:
+    for strategy_id in params.strategy_ids:
         deduplicated = {
             segment_name: deduplicate_candidate_trades(aggregate_fixed[strategy_id][segment_name])
+            for segment_name in ("train", "validation", "test")
+        }
+        raw_deduplicated = {
+            segment_name: deduplicate_candidate_trades(aggregate_raw[strategy_id][segment_name])
             for segment_name in ("train", "validation", "test")
         }
         risk_test_result = apply_risk_sizing_overlay(
@@ -5344,11 +5633,27 @@ def run_candidate_replay(
             window_reports[strategy_id],
             params,
         )
+        validation[strategy_id]["raw_baseline_not_used_for_selection"] = True
+        validation[strategy_id]["raw_baseline"] = {
+            segment_name: build_candidate_direction_report(
+                raw_deduplicated[segment_name],
+                params.minimum_train_trades
+                if segment_name == "train"
+                else params.minimum_out_of_sample_trades,
+                params,
+            )
+            for segment_name in ("train", "validation", "test")
+        }
         for segment_name in ("train", "validation", "test"):
             write_candidate_trades(
                 run_dir / f"aggregate_{segment_name}_{strategy_id.lower()}_fixed.csv",
                 deduplicated[segment_name],
             )
+            if params.train_cost_gate_enabled:
+                write_candidate_trades(
+                    run_dir / f"aggregate_{segment_name}_{strategy_id.lower()}_raw.csv",
+                    raw_deduplicated[segment_name],
+                )
         write_candidate_trades(
             run_dir / f"oos_test_{strategy_id.lower()}_risk.csv",
             risk_test_result["trades"],
@@ -5369,10 +5674,10 @@ def run_candidate_replay(
         "profile_name": params.profile_name,
         "generated_at": utc_now_text(),
         "run_id": run_id,
-        "strategies": list(CANDIDATE_LEDGER_NAMES),
+        "strategies": list(params.strategy_ids),
         "legacy_strategies_frozen": list(LEGACY_CANDIDATE_LEDGER_NAMES),
         "symbol": config.symbol,
-        "source_interval": config.interval,
+        "source_interval": source_interval,
         "execution_interval": params.execution_interval,
         "trend_interval": params.trend_interval,
         "days": days,
@@ -5383,10 +5688,12 @@ def run_candidate_replay(
         "forward_shadow_execution_enabled": config.forward_shadow_execution_enabled,
         "ui_changed": False,
         "strategy_parameters_frozen": True,
+        "train_cost_gate_enabled": params.train_cost_gate_enabled,
+        "test_data_used_for_cost_gate_selection": False,
         "historical_profile_selection_is_not_live_evidence": True,
         "fresh_forward_validation_required": params.requires_fresh_forward_validation,
         "continuous_master_replay_per_strategy": True,
-        "master_replay_count": len(CANDIDATE_LEDGER_NAMES),
+        "master_replay_count": len(params.strategy_ids),
         "window_metrics_are_sliced_from_master_replays": True,
         "fixed_notional_view_purpose": "normalized_strategy_edge_validation",
         "risk_sized_view_purpose": "five_usdt_exchange_feasibility_and_account_risk_validation",
@@ -5424,12 +5731,138 @@ def run_candidate_replay(
     return summary
 
 
+def normalize_candidate_symbols(symbols: Sequence[str]) -> Tuple[str, ...]:
+    normalized: List[str] = []
+    for symbol_value in symbols:
+        symbol = str(symbol_value or "").strip().upper()
+        if not symbol or not symbol.isalnum() or not symbol.endswith("USDT"):
+            raise ConfigError(f"Invalid USD-M candidate symbol: {symbol_value}")
+        if symbol not in normalized:
+            normalized.append(symbol)
+    if not normalized:
+        raise ConfigError("At least one candidate symbol is required")
+    return tuple(normalized)
+
+
+def run_candidate_portfolio_replay(
+    config: Config,
+    symbols: Sequence[str],
+    days: int,
+    end_time: Optional[str],
+    output_dir_value: str,
+    params: CandidateReplayParameters,
+) -> Dict[str, Any]:
+    if config.live_trading or not config.dry_run or not config.shadow_mode:
+        raise ConfigError("Portfolio replay requires LIVE_TRADING=false, DRY_RUN=true, and SHADOW_MODE=true")
+    normalized_symbols = normalize_candidate_symbols(symbols)
+    output_dir = resolve_app_path(output_dir_value)
+    symbol_summaries: Dict[str, Any] = {}
+    errors: Dict[str, str] = {}
+    qualified_symbols: List[str] = []
+    for symbol in normalized_symbols:
+        symbol_config = replace(config, symbol=symbol)
+        symbol_output = output_dir / symbol
+        try:
+            result = run_candidate_replay(
+                symbol_config,
+                days=days,
+                end_time=end_time,
+                cache_file=f"historical_data/{symbol}_{params.source_interval}.csv",
+                funding_cache_file=f"historical_data/{symbol}_funding.csv",
+                output_dir_value=str(symbol_output),
+                params=params,
+            )
+        except Exception as exc:
+            LOGGER.exception("Candidate portfolio replay failed symbol=%s", symbol)
+            errors[symbol] = f"{type(exc).__name__}: {exc}"
+            continue
+        strategy_summaries: Dict[str, Any] = {}
+        symbol_qualified = True
+        for strategy_id in params.strategy_ids:
+            validation = result["out_of_sample_validation"][strategy_id]
+            fixed = validation["fixed_notional"]
+            risk = validation["risk_sized"]
+            raw_test = validation["raw_baseline"]["test"]
+            strategy_qualified = bool(validation["eligible_for_forward_shadow_validation"])
+            symbol_qualified = symbol_qualified and strategy_qualified
+            strategy_summaries[strategy_id] = {
+                "historical_gate_passed": bool(validation["historical_gate_passed"]),
+                "eligible_for_forward_shadow_validation": strategy_qualified,
+                "failure_reasons": list(validation["failure_reasons"]),
+                "test_trades": int(fixed.get("trades", 0) or 0),
+                "test_net_pnl": fixed.get("net_pnl"),
+                "test_expectancy": fixed.get("expectancy"),
+                "test_net_profit_factor": fixed.get("net_profit_factor"),
+                "raw_test_trades": int(raw_test.get("trades", 0) or 0),
+                "raw_test_net_pnl": raw_test.get("net_pnl"),
+                "raw_test_expectancy": raw_test.get("expectancy"),
+                "raw_test_net_profit_factor": raw_test.get("net_profit_factor"),
+                "positive_window_fraction": validation["walk_forward_consistency"].get(
+                    "positive_window_fraction"
+                ),
+                "risk_sized_trades": int(risk.get("trades", 0) or 0),
+                "risk_sized_execution_coverage": float(risk.get("execution_coverage", 0.0) or 0.0),
+                "risk_sized_net_pnl": risk.get("net_pnl"),
+            }
+        if symbol_qualified:
+            qualified_symbols.append(symbol)
+        symbol_summaries[symbol] = {
+            "report_file": str(symbol_output / "latest.json"),
+            "viability_status": result["viability_status"],
+            "qualified": symbol_qualified,
+            "strategies": strategy_summaries,
+        }
+    minimum_qualified_symbols = max(
+        1,
+        int(math.ceil(len(normalized_symbols) * params.minimum_cross_symbol_qualified_fraction)),
+    )
+    portfolio_qualified = (
+        not errors
+        and len(qualified_symbols) >= minimum_qualified_symbols
+        and len(symbol_summaries) == len(normalized_symbols)
+    )
+    summary = {
+        "engine": "cross_symbol_candidate_portfolio_replay_v1",
+        "generated_at": utc_now_text(),
+        "profile_name": params.profile_name,
+        "profile_engine": params.engine_name,
+        "symbols": list(normalized_symbols),
+        "days": days,
+        "source_interval": params.source_interval,
+        "execution_interval": params.execution_interval,
+        "trend_interval": params.trend_interval,
+        "strategies": list(params.strategy_ids),
+        "symbol_summaries": symbol_summaries,
+        "errors": errors,
+        "qualified_symbols": qualified_symbols,
+        "minimum_qualified_symbols": minimum_qualified_symbols,
+        "cross_symbol_qualified_fraction": (
+            len(qualified_symbols) / len(normalized_symbols) if normalized_symbols else 0.0
+        ),
+        "portfolio_historical_gate_passed": portfolio_qualified,
+        "eligible_for_forward_shadow_validation": portfolio_qualified,
+        "eligible_for_micro_live_test": False,
+        "fresh_forward_validation_required": True,
+        "shadow_mode_only": True,
+        "dry_run": True,
+        "live_trading": False,
+        "account_state_changed": False,
+        "recommendation": (
+            "BEGIN_FORWARD_SHADOW_VALIDATION" if portfolio_qualified else "DO_NOT_TRADE_LIVE"
+        ),
+        "source_sha256": file_sha256(Path(__file__).resolve()),
+        "parameters": asdict(params),
+    }
+    write_json_atomic(output_dir / "latest.json", summary)
+    return summary
+
+
 def parse_candidate_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run independent rolling walk-forward strategy validation")
     parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V4)
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--end-time", default=None)
-    parser.add_argument("--cache-file", default="historical_data/SOLUSDT_1m.csv")
+    parser.add_argument("--cache-file", default=None)
     parser.add_argument("--funding-cache-file", default=None)
     parser.add_argument("--output-dir", default="candidate_replay")
     return parser.parse_args(list(arguments))
@@ -5439,14 +5872,41 @@ def candidate_replay_main(arguments: Sequence[str]) -> None:
     args = parse_candidate_replay_args(arguments)
     config = load_config()
     params = candidate_replay_parameters_for_profile(args.profile)
+    cache_file = args.cache_file or f"historical_data/{config.symbol}_{params.source_interval}.csv"
     summary = run_candidate_replay(
         config,
         days=args.days or params.default_replay_days,
         end_time=args.end_time,
-        cache_file=args.cache_file,
+        cache_file=cache_file,
         output_dir_value=args.output_dir,
         params=params,
         funding_cache_file=args.funding_cache_file,
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
+
+
+def parse_candidate_portfolio_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run cross-symbol candidate robustness validation")
+    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V6)
+    parser.add_argument("--symbols", default="SOLUSDT,BTCUSDT,ETHUSDT,BNBUSDT")
+    parser.add_argument("--days", type=int, default=None)
+    parser.add_argument("--end-time", default=None)
+    parser.add_argument("--output-dir", default="candidate_portfolio_replay")
+    return parser.parse_args(list(arguments))
+
+
+def candidate_portfolio_replay_main(arguments: Sequence[str]) -> None:
+    args = parse_candidate_portfolio_replay_args(arguments)
+    config = load_config()
+    params = candidate_replay_parameters_for_profile(args.profile)
+    symbols = tuple(item for item in str(args.symbols).split(",") if item.strip())
+    summary = run_candidate_portfolio_replay(
+        config,
+        symbols=symbols,
+        days=args.days or params.default_replay_days,
+        end_time=args.end_time,
+        output_dir_value=args.output_dir,
+        params=params,
     )
     print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
 
@@ -6881,6 +7341,9 @@ def main() -> None:
             return
         if len(sys.argv) > 1 and sys.argv[1] == "candidate-replay":
             candidate_replay_main(sys.argv[2:])
+            return
+        if len(sys.argv) > 1 and sys.argv[1] == "candidate-portfolio-replay":
+            candidate_portfolio_replay_main(sys.argv[2:])
             return
         config = load_config()
         state = RuntimeState(state_file=config.bot_state_file)

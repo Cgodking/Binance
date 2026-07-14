@@ -1471,6 +1471,14 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertEqual((v5.execution_interval, v5.trend_interval), ("30m", "2h"))
         self.assertEqual(v5.default_replay_days, 900)
         self.assertEqual(v5.embargo_minutes, v5.max_holding_minutes)
+        v6 = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V6
+        )
+        self.assertEqual(v6.source_interval, "30m")
+        self.assertEqual(v6.strategy_ids, (self.module.CANDIDATE_TREND_LONG_NAME,))
+        self.assertEqual(v6.fixed_notional_usdt, 100.0)
+        self.assertTrue(v6.train_cost_gate_enabled)
+        self.assertEqual(v6.minimum_risk_sized_coverage, 0.50)
         with self.assertRaises(self.module.ConfigError):
             self.module.candidate_replay_parameters_for_profile("unknown")
 
@@ -1707,6 +1715,144 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertTrue(result["historical_gate_passed"])
         self.assertTrue(result["eligible_for_forward_shadow_validation"])
         self.assertFalse(result["eligible_for_micro_live_test"])
+
+    def test_v6_cost_gate_uses_frozen_training_buckets(self):
+        params = self.module.replace(
+            self.module.candidate_replay_parameters_for_profile(
+                self.module.CANDIDATE_PROFILE_V6
+            ),
+            cost_gate_min_bucket_trades=10,
+            cost_gate_min_validation_trades=10,
+            bootstrap_samples=100,
+            bootstrap_block_trades=4,
+        )
+        base_trade = {
+            "entry_atr_execution_percentile": 0.20,
+            "entry_ema_spread_pct": 0.005,
+            "pullback_distance_atr": 0.45,
+            "entry_ema_slope_consistency": 0.95,
+            "gross_pnl": 0.12,
+            "fees": 0.01,
+            "slippage": 0.004,
+            "spread_cost": 0.002,
+            "funding_pnl": 0.0,
+            "net_pnl": 0.104,
+        }
+        loss = {**base_trade, "gross_pnl": -0.03, "net_pnl": -0.046}
+        train = [dict(base_trade) for _ in range(29)] + [loss]
+        validation = [dict(base_trade) for _ in range(19)] + [loss]
+
+        gate = self.module.fit_candidate_train_cost_gate(train, params)
+        validation_result = self.module.validate_candidate_train_cost_gate(
+            validation,
+            gate,
+            params,
+        )
+
+        self.assertTrue(gate["gate_usable"])
+        self.assertEqual(gate["allowed_labels"]["atr_percentile"], ["low"])
+        self.assertTrue(validation_result["eligible"])
+        self.assertEqual(validation_result["gated_trade_count"], 20)
+
+    def test_v6_rejects_low_risk_sized_execution_coverage(self):
+        params = self.module.replace(
+            self.module.candidate_replay_parameters_for_profile(
+                self.module.CANDIDATE_PROFILE_V6
+            ),
+            minimum_train_trades=1,
+            minimum_out_of_sample_trades=1,
+            minimum_walk_forward_windows=1,
+            bootstrap_samples=20,
+            bootstrap_block_trades=2,
+        )
+        winning_trade = {
+            "gross_pnl": 0.10,
+            "fees": 0.01,
+            "slippage": 0.005,
+            "spread_cost": 0.005,
+            "funding_pnl": 0.0,
+            "net_pnl": 0.08,
+        }
+        losing_trade = {**winning_trade, "gross_pnl": -0.03, "net_pnl": -0.05}
+        trades = [dict(winning_trade) for _ in range(9)] + [losing_trade]
+        report = self.module.build_candidate_direction_report(trades, 1, params)
+        fixed_segments = {segment: list(trades) for segment in ("train", "validation", "test")}
+        window_reports = {segment: [report] for segment in ("train", "validation", "test")}
+        risk_report = {**report, "trades": 1, "skipped_trade_count": 9, "execution_coverage": 0.10}
+
+        result = self.module.build_walk_forward_strategy_validation(
+            self.module.CANDIDATE_TREND_LONG_NAME,
+            fixed_segments,
+            {"report": risk_report},
+            window_reports,
+            params,
+        )
+
+        self.assertIn(
+            "RISK_SIZED_EXECUTION_COVERAGE_BELOW_THRESHOLD",
+            result["failure_reasons"],
+        )
+        self.assertFalse(result["eligible_for_forward_shadow_validation"])
+
+    def test_cross_symbol_portfolio_requires_three_of_four_symbols(self):
+        params = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V6
+        )
+        symbols = ("SOLUSDT", "BTCUSDT", "ETHUSDT", "BNBUSDT")
+
+        def fake_replay(symbol_config, **_kwargs):
+            qualified = symbol_config.symbol in {"SOLUSDT", "BTCUSDT"}
+            validation = {
+                "historical_gate_passed": qualified,
+                "eligible_for_forward_shadow_validation": qualified,
+                "failure_reasons": [] if qualified else ["TEST_FAILURE"],
+                "fixed_notional": {
+                    "trades": 100,
+                    "net_pnl": 1.0 if qualified else -1.0,
+                    "expectancy": 0.01 if qualified else -0.01,
+                    "net_profit_factor": 1.2 if qualified else 0.8,
+                },
+                "risk_sized": {
+                    "trades": 60,
+                    "execution_coverage": 0.60,
+                    "net_pnl": 0.5 if qualified else -0.5,
+                },
+                "raw_baseline": {
+                    "test": {
+                        "trades": 100,
+                        "net_pnl": 1.0 if qualified else -1.0,
+                        "expectancy": 0.01 if qualified else -0.01,
+                        "net_profit_factor": 1.2 if qualified else 0.8,
+                    }
+                },
+                "walk_forward_consistency": {"positive_window_fraction": 0.75},
+            }
+            return {
+                "viability_status": "TEST",
+                "out_of_sample_validation": {
+                    self.module.CANDIDATE_TREND_LONG_NAME: validation
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            self.module,
+            "run_candidate_replay",
+            side_effect=fake_replay,
+        ):
+            summary = self.module.run_candidate_portfolio_replay(
+                self.config,
+                symbols,
+                days=900,
+                end_time=None,
+                output_dir_value=temp_dir,
+                params=params,
+            )
+
+        self.assertEqual(summary["minimum_qualified_symbols"], 3)
+        self.assertEqual(summary["qualified_symbols"], ["SOLUSDT", "BTCUSDT"])
+        self.assertFalse(summary["eligible_for_forward_shadow_validation"])
+        self.assertFalse(summary["eligible_for_micro_live_test"])
+        self.assertEqual(summary["recommendation"], "DO_NOT_TRADE_LIVE")
 
     def test_candidate_features_never_attach_an_unclosed_future_trend_candle(self):
         rows = []

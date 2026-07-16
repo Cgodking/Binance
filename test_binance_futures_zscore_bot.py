@@ -1479,6 +1479,25 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertEqual(v6.fixed_notional_usdt, 100.0)
         self.assertTrue(v6.train_cost_gate_enabled)
         self.assertEqual(v6.minimum_risk_sized_coverage, 0.50)
+        v7 = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V7
+        )
+        self.assertEqual(
+            (v7.source_interval, v7.execution_interval, v7.trend_interval, v7.regime_interval),
+            ("15m", "15m", "1h", "4h"),
+        )
+        self.assertEqual(
+            v7.strategy_ids,
+            (
+                self.module.CANDIDATE_BREAKOUT_LONG_NAME,
+                self.module.CANDIDATE_BREAKOUT_SHORT_NAME,
+            ),
+        )
+        self.assertTrue(v7.breakout_enabled)
+        self.assertEqual(v7.default_replay_days, 720)
+        self.assertEqual(v7.embargo_minutes, v7.max_holding_minutes)
+        self.assertEqual(v7.minimum_reward_to_cost_ratio, 5.0)
+        self.assertEqual(v7.minimum_net_reward_to_risk_ratio, 2.0)
         with self.assertRaises(self.module.ConfigError):
             self.module.candidate_replay_parameters_for_profile("unknown")
 
@@ -1488,10 +1507,231 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             ["--profile", self.module.CANDIDATE_PROFILE_V5, "--days", "930"]
         )
 
-        self.assertEqual(defaults.profile, self.module.CANDIDATE_PROFILE_V4)
+        self.assertEqual(defaults.profile, self.module.CANDIDATE_PROFILE_V7)
         self.assertIsNone(defaults.days)
         self.assertEqual(selected.profile, self.module.CANDIDATE_PROFILE_V5)
         self.assertEqual(selected.days, 930)
+
+    def test_v7_donchian_and_volume_baselines_exclude_current_candle(self):
+        params = self.module.replace(
+            self.params,
+            source_interval="15m",
+            execution_interval="15m",
+            donchian_lookback=3,
+            volume_lookback=3,
+        )
+        rows = []
+        interval_ms = 15 * 60 * 1000
+        for index in range(8):
+            rows.append(
+                {
+                    "open_time": index * interval_ms,
+                    "open": 100.0,
+                    "high": 101.0 + index,
+                    "low": 99.0 - index,
+                    "close": 100.0,
+                    "volume": 10.0 if index < 3 else 1000.0,
+                    "close_time": (index + 1) * interval_ms - 1,
+                }
+            )
+
+        features = self.module.build_candidate_feature_frame(
+            self.module.pd.DataFrame(rows),
+            params,
+            source_interval="15m",
+        )
+        first_ready = features.iloc[3]
+
+        self.assertEqual(first_ready["donchian_high"], 103.0)
+        self.assertEqual(first_ready["donchian_low"], 97.0)
+        self.assertEqual(first_ready["volume_ratio"], 100.0)
+
+    def test_v7_breakout_requires_closed_higher_timeframes_and_volume_expansion(self):
+        params = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V7
+        )
+        row = {
+            "close_time": 1000,
+            "trend_feature_close_time": 1000,
+            "regime_feature_close_time": 1000,
+            "trend_side": 1,
+            "regime_side": 1,
+            "close": 101.0,
+            "donchian_high": 100.0,
+            "donchian_low": 95.0,
+            "volume_ratio": 1.31,
+        }
+
+        accepted, reason = self.module.evaluate_breakout_candidate_signal(row, "LONG", params)
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+
+        rejected, reason = self.module.evaluate_breakout_candidate_signal(
+            {**row, "volume_ratio": 1.30},
+            "LONG",
+            params,
+        )
+        self.assertFalse(rejected)
+        self.assertEqual(reason, "VOLUME_EXPANSION_NOT_CONFIRMED")
+
+        rejected, reason = self.module.evaluate_breakout_candidate_signal(
+            {**row, "regime_feature_close_time": 1001},
+            "LONG",
+            params,
+        )
+        self.assertFalse(rejected)
+        self.assertEqual(reason, "FUTURE_HIGHER_TIMEFRAME_CANDLE_BLOCKED")
+
+        accepted, reason = self.module.evaluate_breakout_candidate_signal(
+            {
+                **row,
+                "trend_side": -1,
+                "regime_side": -1,
+                "close": 94.0,
+            },
+            "SHORT",
+            params,
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+
+    def test_v7_feature_merge_never_attaches_future_regime_candle(self):
+        params = self.module.replace(
+            self.module.candidate_replay_parameters_for_profile(
+                self.module.CANDIDATE_PROFILE_V7
+            ),
+            trend_fast_ema_period=2,
+            trend_slow_ema_period=3,
+            regime_fast_ema_period=2,
+            regime_slow_ema_period=3,
+            regime_slope_lookback=1,
+            atr_percentile_window=4,
+        )
+        interval_ms = 15 * 60 * 1000
+        rows = []
+        for index in range(80):
+            close = 100.0 + index * 0.1
+            rows.append(
+                {
+                    "open_time": index * interval_ms,
+                    "open": close,
+                    "high": close + 0.2,
+                    "low": close - 0.2,
+                    "close": close,
+                    "volume": 10.0,
+                    "close_time": (index + 1) * interval_ms - 1,
+                }
+            )
+
+        features = self.module.build_candidate_feature_frame(
+            self.module.pd.DataFrame(rows),
+            params,
+            source_interval="15m",
+        )
+        available = features.dropna(subset=["regime_feature_close_time"])
+
+        self.assertGreater(len(available), 0)
+        self.assertTrue(
+            (
+                available["regime_feature_close_time"].astype("int64")
+                <= available["close_time"].astype("int64")
+            ).all()
+        )
+
+    def test_v7_atr_risk_and_cost_gate_meet_frozen_thresholds(self):
+        params = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V7
+        )
+        stop_loss_pct, take_profit_pct = self.module.candidate_entry_risk_profile(
+            100.0,
+            1.0,
+            params,
+        )
+        metrics = self.module.candidate_entry_cost_metrics(
+            stop_loss_pct,
+            take_profit_pct,
+            self.config,
+            params,
+        )
+
+        self.assertEqual((stop_loss_pct, take_profit_pct), (0.01, 0.03))
+        self.assertGreaterEqual(
+            metrics["reward_to_cost_ratio"],
+            params.minimum_reward_to_cost_ratio,
+        )
+        self.assertGreaterEqual(
+            metrics["net_reward_to_risk_ratio"],
+            params.minimum_net_reward_to_risk_ratio,
+        )
+
+    def test_v7_breakout_executes_only_at_next_candle_open(self):
+        params = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V7
+        )
+        interval_ms = 15 * 60 * 1000
+
+        def row(index, open_price, high, low, close, volume_ratio):
+            close_time = (index + 1) * interval_ms - 1
+            return {
+                "open_time": index * interval_ms,
+                "close_time": close_time,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": 100.0,
+                "trend_feature_close_time": close_time,
+                "trend_ema20": 101.0,
+                "trend_ema50": 99.0,
+                "trend_fast_ema": 101.0,
+                "trend_slow_ema": 99.0,
+                "trend_atr": 1.0,
+                "trend_ema_spread_pct": 0.02,
+                "trend_side": 1,
+                "trend_persistence": 10,
+                "long_slope_consistency": 1.0,
+                "short_slope_consistency": 0.0,
+                "regime_feature_close_time": close_time,
+                "regime_fast_ema": 102.0,
+                "regime_slow_ema": 98.0,
+                "regime_slope_pct": 0.01,
+                "regime_side": 1,
+                "atr_execution": 1.0,
+                "atr_execution_pct": 0.01,
+                "atr_execution_percentile": 0.5,
+                "candidate_zscore": 0.0,
+                "donchian_high": 101.0,
+                "donchian_low": 95.0,
+                "volume_ratio": volume_ratio,
+            }
+
+        frame = self.module.pd.DataFrame(
+            [
+                row(0, 100.0, 100.5, 99.5, 100.0, 1.0),
+                row(1, 100.0, 102.0, 99.8, 101.5, 1.4),
+                row(2, 102.0, 106.0, 101.8, 105.5, 1.0),
+            ]
+        )
+
+        result = self.module.candidate_replay_strategy(
+            self.config,
+            self.filters,
+            frame,
+            0,
+            3 * interval_ms,
+            self.module.CANDIDATE_BREAKOUT_LONG_NAME,
+            params,
+        )
+
+        self.assertEqual(len(result["trades"]), 1)
+        trade = result["trades"][0]
+        self.assertEqual(trade["entry_price"], 102.0)
+        self.assertEqual(trade["entry_time_ms"], 2 * interval_ms)
+        self.assertEqual(trade["strategy_id"], self.module.CANDIDATE_BREAKOUT_LONG_NAME)
+        self.assertEqual(trade["side"], "LONG")
+        self.assertEqual(trade["entry_volume_ratio"], 1.4)
+        self.assertGreaterEqual(trade["expected_reward_to_cost_ratio"], 5.0)
+        self.assertGreaterEqual(trade["expected_net_reward_to_risk_ratio"], 2.0)
 
     def _signal_rows(self, atr_execution):
         previous = {
@@ -2020,7 +2260,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertEqual(result["report"]["trades"], 0)
         self.assertEqual(
             result["report"]["skip_reasons"],
-            {"MINIMUM_ORDER_EXCEEDS_RISK_BUDGET": 1},
+            {"TRADE_SKIPPED_MIN_NOTIONAL": 1},
         )
 
     def test_cost_stress_and_block_bootstrap_are_fee_aware(self):

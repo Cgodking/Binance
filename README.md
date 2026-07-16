@@ -48,16 +48,17 @@ python3 -m unittest -v test_binance_futures_zscore_bot.py
 python3 binance_futures_zscore_bot.py replay --days 180
 ```
 
-运行冻结参数的趋势回调独立策略滚动验证：
+运行冻结参数的候选策略滚动验证：
 
 ```bash
 python3 binance_futures_zscore_bot.py candidate-replay --profile v4_15m_1h
 python3 binance_futures_zscore_bot.py candidate-replay --profile v5_30m_2h
 python3 binance_futures_zscore_bot.py candidate-replay --profile v6_long_cost_gate_30m_2h
+python3 binance_futures_zscore_bot.py candidate-replay --profile v7_cost_aware_breakout_15m_1h_4h
 python3 binance_futures_zscore_bot.py candidate-portfolio-replay --profile v6_long_cost_gate_30m_2h
 ```
 
-V3、V4、V5、V6 profile 均保留冻结参数，历史报告可以按版本复现。V5 默认使用 900 天数据，并执行以下验证：
+V3、V4、V5、V6、V7 profile 均保留冻结参数，历史报告可以按版本复现。V5 默认使用 900 天数据，并执行以下验证：
 
 - 使用闭合 2 小时 K 线确认趋势，使用闭合 30 分钟 K 线确认 ATR 自适应回调，并在下一根 30 分钟 K 线开盘模拟成交。
 - 270 天训练、90 天验证、90 天测试，每次向前滚动 90 天。
@@ -80,6 +81,19 @@ V6 不再同时探索多空方向，只验证 Long，并增加严格的训练成
 - V6 使用 100 USDT 固定名义金额归一化不同合约的研究收益，避免 BTC 最小数量步进让研究账本失真；独立的 5 USDT 风险账本仍按真实过滤器拒绝不可执行订单。
 - 跨品种验证固定使用 SOLUSDT、BTCUSDT、ETHUSDT、BNBUSDT；至少 3 个品种通过且 5 USDT 风险账本覆盖率不低于 50%，才能进入未来影子验证。
 - 跨品种历史通过仍不会自动启用 `FORWARD_SHADOW_EXECUTION_ENABLED`，更不会启用真实交易。
+
+V7 是成本感知的低频趋势突破实验，不复用旧 Z-score 或趋势回调入场：
+
+- 使用闭合 4 小时 K 线的 EMA50/EMA200 与 EMA50 斜率确定大级别方向，使用闭合 1 小时 EMA50/EMA200 确认趋势结构。
+- 15 分钟收盘价必须突破此前 20 根已闭合 K 线的 Donchian 通道，当前成交量必须大于此前 20 根平均成交量的 1.3 倍。
+- 信号仅在 15 分钟 K 线闭合后成立，并在下一根 15 分钟 K 线开盘模拟成交；高周期特征不会读取尚未闭合或未来的 K 线。
+- Long 与 Short 使用 `COST_AWARE_TREND_BREAKOUT_V7_LONG` 和 `COST_AWARE_TREND_BREAKOUT_V7_SHORT` 两个独立账本，不合并判断准入。
+- 初始止损为 1 ATR，目标为 3 ATR，最长持仓 72 小时；趋势结构失效、止损、止盈或超时均可触发退出。
+- 入场前要求毛目标收益至少为预计手续费、滑点、点差和资金费缓冲的 5 倍，并要求扣除预计成本后的净盈亏比不低于 2。
+- 使用 180 天训练、90 天验证、90 天测试，每次滚动 90 天；720 天数据形成 5 个窗口，边界隔离时间为 72 小时。
+- 5 USDT 风险账本按单笔不超过余额 1% 且不超过 0.05 USDT 计算数量。最小有效订单超过风险预算时记录 `TRADE_SKIPPED_MIN_NOTIONAL`，不会提高仓位。
+
+截至 2026-07-17 的 720 天 SOLUSDT 冻结回放中，V7 未通过历史门槛：Long 测试 156 笔、净期望 -0.1807、净利润因子 0.7234；Short 测试 215 笔、净期望 -0.1842、净利润因子 0.7352。5 USDT 风险账本中 Long 全部订单因最小名义金额超过风险预算而跳过，Short 仅有 2 笔可执行且净亏损。结论保持 `DO_NOT_TRADE_LIVE`。
 
 历史回放仅使用公开市场数据，不使用 API 密钥。行情缓存、资金费率缓存、交易记录和研究报告会写入已被 `.gitignore` 排除的本地目录。
 

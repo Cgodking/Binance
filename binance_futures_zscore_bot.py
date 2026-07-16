@@ -52,15 +52,19 @@ CANDIDATE_PROFILE_V3 = "v3_5m_15m"
 CANDIDATE_PROFILE_V4 = "v4_15m_1h"
 CANDIDATE_PROFILE_V5 = "v5_30m_2h"
 CANDIDATE_PROFILE_V6 = "v6_long_cost_gate_30m_2h"
+CANDIDATE_PROFILE_V7 = "v7_cost_aware_breakout_15m_1h_4h"
 CANDIDATE_REPLAY_PROFILES = (
     CANDIDATE_PROFILE_V3,
     CANDIDATE_PROFILE_V4,
     CANDIDATE_PROFILE_V5,
     CANDIDATE_PROFILE_V6,
+    CANDIDATE_PROFILE_V7,
 )
 CANDIDATE_DIRECTIONS = ("LONG", "SHORT")
 CANDIDATE_TREND_LONG_NAME = "TREND_PULLBACK_LONG"
 CANDIDATE_TREND_SHORT_NAME = "TREND_PULLBACK_SHORT"
+CANDIDATE_BREAKOUT_LONG_NAME = "COST_AWARE_TREND_BREAKOUT_V7_LONG"
+CANDIDATE_BREAKOUT_SHORT_NAME = "COST_AWARE_TREND_BREAKOUT_V7_SHORT"
 CANDIDATE_MEAN_REVERSION_NAME = "MEAN_REVERSION_INDEPENDENT"
 CANDIDATE_LEDGER_NAMES = (
     CANDIDATE_TREND_LONG_NAME,
@@ -70,6 +74,10 @@ LEGACY_CANDIDATE_LEDGER_NAMES = (
     CANDIDATE_MEAN_REVERSION_NAME,
 )
 SUPPORTED_CANDIDATE_LEDGER_NAMES = CANDIDATE_LEDGER_NAMES + LEGACY_CANDIDATE_LEDGER_NAMES
+SUPPORTED_CANDIDATE_LEDGER_NAMES += (
+    CANDIDATE_BREAKOUT_LONG_NAME,
+    CANDIDATE_BREAKOUT_SHORT_NAME,
+)
 ELITE_STRATEGY_NAME = "ELITE_LONG_STRATEGY"
 SHADOW_PROBE_STRATEGY_NAME = "SHADOW_PROBE_STRATEGY"
 ROUTER_NAME = "REGIME_STRATEGY_ROUTER"
@@ -223,6 +231,15 @@ CANDIDATE_TRADE_FIELDNAMES = [
     "initial_stop_distance_pct",
     "initial_take_profit_distance_pct",
     "entry_zscore",
+    "entry_regime_interval",
+    "entry_regime_fast_ema",
+    "entry_regime_slow_ema",
+    "entry_regime_slope_pct",
+    "entry_donchian_high",
+    "entry_donchian_low",
+    "entry_volume_ratio",
+    "expected_reward_to_cost_ratio",
+    "expected_net_reward_to_risk_ratio",
     "gross_pnl",
     "fees",
     "slippage",
@@ -343,6 +360,7 @@ class CandidateReplayParameters:
     source_interval: str = "1m"
     execution_interval: str = "15m"
     trend_interval: str = "1h"
+    regime_interval: Optional[str] = None
     strategy_ids: Tuple[str, ...] = CANDIDATE_LEDGER_NAMES
     trend_fast_ema_period: int = 20
     trend_slow_ema_period: int = 50
@@ -351,12 +369,20 @@ class CandidateReplayParameters:
     slope_consistency_window: int = 5
     min_slope_consistency: float = 0.80
     min_ema_spread_pct: float = 0.0020
+    regime_fast_ema_period: int = 50
+    regime_slow_ema_period: int = 200
+    regime_slope_lookback: int = 3
+    breakout_enabled: bool = False
+    donchian_lookback: int = 20
+    volume_lookback: int = 20
+    volume_expansion_multiplier: float = 1.30
     atr_execution_period: int = 14
     atr_percentile_window: int = 96
     max_atr_percentile: float = 0.70
     max_pullback_distance_atr: float = 0.70
     stop_loss_atr_multiple: float = 1.50
     take_profit_atr_multiple: float = 3.00
+    target_reward_to_risk_multiple: Optional[float] = None
     minimum_stop_loss_pct: float = 0.0055
     maximum_stop_loss_pct: float = 0.0200
     minimum_take_profit_pct: float = 0.0120
@@ -377,11 +403,20 @@ class CandidateReplayParameters:
     bootstrap_samples: int = 1000
     bootstrap_block_trades: int = 8
     maximum_tp_cost_ratio: float = 0.20
+    minimum_reward_to_cost_ratio: float = 0.0
+    minimum_net_reward_to_risk_ratio: float = 0.0
+    anticipated_funding_cost_pct: float = 0.0
     minimum_train_trades: int = 100
+    minimum_validation_trades: Optional[int] = None
     minimum_out_of_sample_trades: int = 100
     minimum_positive_window_fraction: float = 0.60
     minimum_net_profit_factor: float = 1.15
+    minimum_train_net_profit_factor: Optional[float] = None
+    minimum_validation_net_profit_factor: Optional[float] = None
+    minimum_test_net_profit_factor: Optional[float] = None
     maximum_drawdown_usdt: float = 0.20
+    enforce_fixed_notional_drawdown: bool = True
+    maximum_risk_sized_drawdown_usdt: float = 0.20
     maximum_cost_to_gross_profit_ratio: float = 0.30
     requires_fresh_forward_validation: bool = True
     train_cost_gate_enabled: bool = False
@@ -450,6 +485,51 @@ def candidate_replay_parameters_for_profile(profile_name: str) -> CandidateRepla
             strategy_ids=(CANDIDATE_TREND_LONG_NAME,),
             fixed_notional_usdt=100.0,
             train_cost_gate_enabled=True,
+            minimum_risk_sized_coverage=0.50,
+        )
+    if normalized == CANDIDATE_PROFILE_V7:
+        return replace(
+            base,
+            strategy_name="COST_AWARE_TREND_BREAKOUT_V7",
+            profile_name=CANDIDATE_PROFILE_V7,
+            engine_name="cost_aware_breakout_15m_1h_4h_rolling_walk_forward_v7",
+            default_replay_days=720,
+            source_interval="15m",
+            execution_interval="15m",
+            trend_interval="1h",
+            regime_interval="4h",
+            strategy_ids=(CANDIDATE_BREAKOUT_LONG_NAME, CANDIDATE_BREAKOUT_SHORT_NAME),
+            trend_fast_ema_period=50,
+            trend_slow_ema_period=200,
+            breakout_enabled=True,
+            stop_loss_atr_multiple=1.0,
+            take_profit_atr_multiple=3.0,
+            target_reward_to_risk_multiple=3.0,
+            minimum_stop_loss_pct=0.0070,
+            maximum_stop_loss_pct=0.0300,
+            minimum_take_profit_pct=0.0210,
+            maximum_take_profit_pct=0.0900,
+            max_holding_minutes=72 * 60,
+            cooldown_minutes=240,
+            fixed_notional_usdt=100.0,
+            walk_forward_train_days=180,
+            walk_forward_validation_days=90,
+            walk_forward_test_days=90,
+            walk_forward_step_days=90,
+            embargo_minutes=72 * 60,
+            minimum_walk_forward_windows=5,
+            minimum_train_trades=50,
+            minimum_validation_trades=30,
+            minimum_out_of_sample_trades=50,
+            minimum_train_net_profit_factor=1.20,
+            minimum_validation_net_profit_factor=1.15,
+            minimum_test_net_profit_factor=1.15,
+            minimum_reward_to_cost_ratio=5.0,
+            minimum_net_reward_to_risk_ratio=2.0,
+            anticipated_funding_cost_pct=0.0003,
+            train_cost_gate_enabled=False,
+            enforce_fixed_notional_drawdown=False,
+            maximum_risk_sized_drawdown_usdt=0.20,
             minimum_risk_sized_coverage=0.50,
         )
     raise ConfigError(f"Unsupported candidate replay profile: {profile_name}")
@@ -4026,6 +4106,16 @@ def build_candidate_feature_frame(
         .rolling(params.atr_percentile_window, min_periods=params.atr_percentile_window)
         .rank(pct=True)
     )
+    primary["donchian_high"] = (
+        primary["high"].shift(1).rolling(params.donchian_lookback, min_periods=params.donchian_lookback).max()
+    )
+    primary["donchian_low"] = (
+        primary["low"].shift(1).rolling(params.donchian_lookback, min_periods=params.donchian_lookback).min()
+    )
+    prior_volume_sma = (
+        primary["volume"].shift(1).rolling(params.volume_lookback, min_periods=params.volume_lookback).mean()
+    ).replace(0.0, np.nan)
+    primary["volume_ratio"] = primary["volume"] / prior_volume_sma
     rolling_close = primary["close"].rolling(feature_config.lookback)
     rolling_std = rolling_close.std(ddof=0).replace(0.0, np.nan)
     primary["candidate_zscore"] = (primary["close"] - rolling_close.mean()) / rolling_std
@@ -4087,6 +4177,8 @@ def build_candidate_feature_frame(
         trend[column] = pd.to_numeric(trend[column], errors="coerce")
     trend["trend_ema20"] = trend["close"].ewm(span=params.trend_fast_ema_period, adjust=False).mean()
     trend["trend_ema50"] = trend["close"].ewm(span=params.trend_slow_ema_period, adjust=False).mean()
+    trend["trend_fast_ema"] = trend["trend_ema20"]
+    trend["trend_slow_ema"] = trend["trend_ema50"]
     trend["trend_atr"] = candidate_true_range(trend).rolling(params.trend_atr_period).mean()
     trend["trend_ema_spread_pct"] = (
         (trend["trend_ema20"] - trend["trend_ema50"]).abs() / trend["close"]
@@ -4113,6 +4205,8 @@ def build_candidate_feature_frame(
         "trend_feature_close_time",
         "trend_ema20",
         "trend_ema50",
+        "trend_fast_ema",
+        "trend_slow_ema",
         "trend_atr",
         "trend_ema_spread_pct",
         "trend_side",
@@ -4127,6 +4221,47 @@ def build_candidate_feature_frame(
         direction="backward",
         allow_exact_matches=True,
     )
+    if params.regime_interval:
+        regime = resample_closed_klines(primary, params.execution_interval, params.regime_interval)
+        for column in ("open", "high", "low", "close", "volume"):
+            regime[column] = pd.to_numeric(regime[column], errors="coerce")
+        regime["regime_fast_ema"] = regime["close"].ewm(
+            span=params.regime_fast_ema_period,
+            adjust=False,
+        ).mean()
+        regime["regime_slow_ema"] = regime["close"].ewm(
+            span=params.regime_slow_ema_period,
+            adjust=False,
+        ).mean()
+        regime["regime_slope_pct"] = regime["regime_fast_ema"].pct_change(
+            periods=params.regime_slope_lookback
+        )
+        regime["regime_side"] = np.select(
+            [
+                (regime["regime_fast_ema"] > regime["regime_slow_ema"])
+                & (regime["regime_slope_pct"] > 0),
+                (regime["regime_fast_ema"] < regime["regime_slow_ema"])
+                & (regime["regime_slope_pct"] < 0),
+            ],
+            [1, -1],
+            default=0,
+        ).astype(int)
+        regime["regime_feature_close_time"] = regime["close_time"].astype("int64")
+        regime_columns = [
+            "close_time",
+            "regime_feature_close_time",
+            "regime_fast_ema",
+            "regime_slow_ema",
+            "regime_slope_pct",
+            "regime_side",
+        ]
+        features = pd.merge_asof(
+            features.sort_values("close_time"),
+            regime[regime_columns].sort_values("close_time"),
+            on="close_time",
+            direction="backward",
+            allow_exact_matches=True,
+        )
     return features.reset_index(drop=True)
 
 
@@ -4211,6 +4346,54 @@ def evaluate_candidate_signal(
     return True, "", pullback_distance
 
 
+def candidate_strategy_direction(strategy_id: str) -> str:
+    if strategy_id in (CANDIDATE_TREND_LONG_NAME, CANDIDATE_BREAKOUT_LONG_NAME):
+        return "LONG"
+    if strategy_id in (CANDIDATE_TREND_SHORT_NAME, CANDIDATE_BREAKOUT_SHORT_NAME):
+        return "SHORT"
+    raise ConfigError(f"Candidate strategy has no fixed direction: {strategy_id}")
+
+
+def evaluate_breakout_candidate_signal(
+    current: Any,
+    direction: str,
+    params: CandidateReplayParameters,
+) -> Tuple[bool, str]:
+    if direction not in CANDIDATE_DIRECTIONS:
+        raise ConfigError(f"Unsupported candidate direction: {direction}")
+    try:
+        current_close_time = int(current["close_time"])
+        trend_close_time = int(current["trend_feature_close_time"])
+        regime_close_time = int(current["regime_feature_close_time"])
+        trend_side = int(current["trend_side"])
+        regime_side = int(current["regime_side"])
+        close_price = float(current["close"])
+        donchian_high = float(current["donchian_high"])
+        donchian_low = float(current["donchian_low"])
+        volume_ratio = float(current["volume_ratio"])
+    except (KeyError, TypeError, ValueError):
+        return False, "MISSING_BREAKOUT_FEATURES"
+    if not all(
+        math.isfinite(value)
+        for value in (close_price, donchian_high, donchian_low, volume_ratio)
+    ):
+        return False, "MISSING_BREAKOUT_FEATURES"
+    if trend_close_time > current_close_time or regime_close_time > current_close_time:
+        return False, "FUTURE_HIGHER_TIMEFRAME_CANDLE_BLOCKED"
+    expected_side = 1 if direction == "LONG" else -1
+    if regime_side != expected_side:
+        return False, "REGIME_DIRECTION_MISMATCH"
+    if trend_side != expected_side:
+        return False, "TREND_DIRECTION_MISMATCH"
+    if volume_ratio <= params.volume_expansion_multiplier:
+        return False, "VOLUME_EXPANSION_NOT_CONFIRMED"
+    if direction == "LONG" and close_price <= donchian_high:
+        return False, "DONCHIAN_HIGH_NOT_BROKEN"
+    if direction == "SHORT" and close_price >= donchian_low:
+        return False, "DONCHIAN_LOW_NOT_BROKEN"
+    return True, ""
+
+
 def evaluate_mean_reversion_candidate_signal(
     current: Any,
     previous: Any,
@@ -4276,18 +4459,68 @@ def candidate_entry_risk_profile(
         max(atr_pct * params.stop_loss_atr_multiple, params.minimum_stop_loss_pct),
         params.maximum_stop_loss_pct,
     )
+    if params.target_reward_to_risk_multiple is not None:
+        take_profit_pct = stop_loss_pct * params.target_reward_to_risk_multiple
+    else:
+        take_profit_pct = atr_pct * params.take_profit_atr_multiple
     take_profit_pct = min(
-        max(atr_pct * params.take_profit_atr_multiple, params.minimum_take_profit_pct),
+        max(take_profit_pct, params.minimum_take_profit_pct),
         params.maximum_take_profit_pct,
     )
     return stop_loss_pct, take_profit_pct
 
 
+def candidate_expected_entry_cost_rate(
+    config: Config,
+    params: CandidateReplayParameters,
+) -> float:
+    return round_trip_execution_cost_rate(config) + params.anticipated_funding_cost_pct
+
+
+def candidate_entry_cost_metrics(
+    stop_loss_pct: float,
+    take_profit_pct: float,
+    config: Config,
+    params: CandidateReplayParameters,
+) -> Dict[str, float]:
+    expected_cost_rate = candidate_expected_entry_cost_rate(config, params)
+    reward_to_cost_ratio = (
+        take_profit_pct / expected_cost_rate if expected_cost_rate > 0 else math.inf
+    )
+    net_reward = take_profit_pct - expected_cost_rate
+    net_risk = stop_loss_pct + expected_cost_rate
+    net_reward_to_risk_ratio = net_reward / net_risk if net_risk > 0 else 0.0
+    return {
+        "expected_cost_rate": expected_cost_rate,
+        "reward_to_cost_ratio": reward_to_cost_ratio,
+        "net_reward_to_risk_ratio": net_reward_to_risk_ratio,
+    }
+
+
 def candidate_estimated_tp_cost_ratio(config: Config, params: CandidateReplayParameters) -> float:
-    round_trip_cost_pct = round_trip_execution_cost_rate(config)
+    round_trip_cost_pct = candidate_expected_entry_cost_rate(config, params)
     if params.minimum_take_profit_pct <= 0:
         return math.inf
     return round_trip_cost_pct / params.minimum_take_profit_pct
+
+
+def candidate_risk_config(config: Config, params: CandidateReplayParameters) -> Config:
+    return replace(
+        config,
+        max_net_loss_per_trade_usdt=params.executable_max_net_loss_per_trade_usdt,
+        max_risk_per_trade_pct=params.executable_max_risk_per_trade_pct,
+        gap_risk_buffer_pct=config.gap_risk_buffer_pct + params.anticipated_funding_cost_pct,
+    )
+
+
+def candidate_risk_skip_reason(reason: str) -> str:
+    if reason in {
+        "MINIMUM_ORDER_EXCEEDS_RISK_BUDGET",
+        "SIZED_QUANTITY_BELOW_EXCHANGE_MINIMUM",
+        "MINIMUM_QUANTITY_EXCEEDS_MAXIMUM",
+    }:
+        return "TRADE_SKIPPED_MIN_NOTIONAL"
+    return reason or "INVALID_EXCHANGE_FILTER_QUANTITY"
 
 
 def candidate_order_quantity(
@@ -4416,6 +4649,17 @@ def close_candidate_position(
         "initial_stop_distance_pct": position["initial_stop_distance_pct"],
         "initial_take_profit_distance_pct": position["initial_take_profit_distance_pct"],
         "entry_zscore": position.get("entry_zscore"),
+        "entry_regime_interval": position.get("entry_regime_interval"),
+        "entry_regime_fast_ema": position.get("entry_regime_fast_ema"),
+        "entry_regime_slow_ema": position.get("entry_regime_slow_ema"),
+        "entry_regime_slope_pct": position.get("entry_regime_slope_pct"),
+        "entry_donchian_high": position.get("entry_donchian_high"),
+        "entry_donchian_low": position.get("entry_donchian_low"),
+        "entry_volume_ratio": position.get("entry_volume_ratio"),
+        "expected_reward_to_cost_ratio": position.get("expected_reward_to_cost_ratio"),
+        "expected_net_reward_to_risk_ratio": position.get(
+            "expected_net_reward_to_risk_ratio"
+        ),
         "gross_pnl": gross_pnl,
         "fees": fees,
         "slippage": slippage,
@@ -4466,11 +4710,7 @@ def candidate_replay_strategy(
         config,
         params,
     )
-    risk_config = replace(
-        config,
-        max_net_loss_per_trade_usdt=params.executable_max_net_loss_per_trade_usdt,
-        max_risk_per_trade_pct=params.executable_max_risk_per_trade_pct,
-    )
+    risk_config = candidate_risk_config(config, params)
     close_times = features["close_time"].astype("int64").to_numpy()
     indexes = np.flatnonzero((close_times >= segment_start_ms) & (close_times < segment_end_ms))
     trades: List[Dict[str, Any]] = []
@@ -4503,6 +4743,30 @@ def candidate_replay_strategy(
                 entered_this_candle = True
                 continue
             stop_loss_pct, take_profit_pct = entry_risk_profile
+            entry_cost_metrics = candidate_entry_cost_metrics(
+                stop_loss_pct,
+                take_profit_pct,
+                config,
+                params,
+            )
+            if (
+                params.minimum_reward_to_cost_ratio > 0
+                and entry_cost_metrics["reward_to_cost_ratio"]
+                < params.minimum_reward_to_cost_ratio
+            ):
+                rejection_counts["EXPECTED_REWARD_TO_COST_BELOW_THRESHOLD"] += 1
+                pending = None
+                entered_this_candle = True
+                continue
+            if (
+                params.minimum_net_reward_to_risk_ratio > 0
+                and entry_cost_metrics["net_reward_to_risk_ratio"]
+                < params.minimum_net_reward_to_risk_ratio
+            ):
+                rejection_counts["NET_REWARD_TO_RISK_BELOW_THRESHOLD"] += 1
+                pending = None
+                entered_this_candle = True
+                continue
             sizing = None
             if sizing_mode == "risk_sized":
                 sizing = build_risk_sizing_plan(
@@ -4538,17 +4802,20 @@ def candidate_replay_strategy(
                     "estimated_net_loss_usdt": float(
                         sizing.estimated_net_loss_usdt if sizing is not None else 0.0
                     ),
+                    "expected_reward_to_cost_ratio": entry_cost_metrics[
+                        "reward_to_cost_ratio"
+                    ],
+                    "expected_net_reward_to_risk_ratio": entry_cost_metrics[
+                        "net_reward_to_risk_ratio"
+                    ],
                     "mfe_pct": 0.0,
                     "mae_pct": 0.0,
                     "time_to_mfe_seconds": 0.0,
                     "time_to_mae_seconds": 0.0,
                 }
             else:
-                rejection_counts[
-                    sizing.skip_reason
-                    if sizing is not None and sizing.skip_reason
-                    else "INVALID_EXCHANGE_FILTER_QUANTITY"
-                ] += 1
+                raw_skip_reason = sizing.skip_reason if sizing is not None else ""
+                rejection_counts[candidate_risk_skip_reason(raw_skip_reason)] += 1
             pending = None
             entered_this_candle = True
 
@@ -4606,14 +4873,26 @@ def candidate_replay_strategy(
             else:
                 update_candidate_excursions(position, row)
                 trend_side = int(row["trend_side"]) if pd.notna(row["trend_side"]) else 0
-                trend_invalidated = strategy_id != CANDIDATE_MEAN_REVERSION_NAME and (
-                    (side == "LONG" and trend_side == -1)
-                    or (side == "SHORT" and trend_side == 1)
-                )
+                expected_side = 1 if side == "LONG" else -1
+                if strategy_id in (
+                    CANDIDATE_BREAKOUT_LONG_NAME,
+                    CANDIDATE_BREAKOUT_SHORT_NAME,
+                ):
+                    regime_side = int(row["regime_side"]) if pd.notna(row.get("regime_side")) else 0
+                    trend_invalidated = (
+                        trend_side != expected_side or regime_side != expected_side
+                    )
+                    trend_exit_reason = "COMPLETED_HIGHER_TIMEFRAME_TREND_INVALIDATION"
+                else:
+                    trend_invalidated = strategy_id != CANDIDATE_MEAN_REVERSION_NAME and (
+                        (side == "LONG" and trend_side == -1)
+                        or (side == "SHORT" and trend_side == 1)
+                    )
+                    trend_exit_reason = "COMPLETED_15M_TREND_INVALIDATION"
                 held_ms = int(row["close_time"]) - int(position["entry_open_time_ms"])
                 if trend_invalidated:
                     exit_price = float(row["close"])
-                    exit_reason = "COMPLETED_15M_TREND_INVALIDATION"
+                    exit_reason = trend_exit_reason
                 elif strategy_id == CANDIDATE_MEAN_REVERSION_NAME and pd.notna(row.get("candidate_zscore")):
                     current_zscore = float(row["candidate_zscore"])
                     mean_exit = (
@@ -4657,8 +4936,15 @@ def candidate_replay_strategy(
                 config,
             )
             pullback_distance = 0.0
+        elif strategy_id in (
+            CANDIDATE_BREAKOUT_LONG_NAME,
+            CANDIDATE_BREAKOUT_SHORT_NAME,
+        ):
+            direction = candidate_strategy_direction(strategy_id)
+            accepted, reason = evaluate_breakout_candidate_signal(row, direction, params)
+            pullback_distance = 0.0
         else:
-            direction = "LONG" if strategy_id == CANDIDATE_TREND_LONG_NAME else "SHORT"
+            direction = candidate_strategy_direction(strategy_id)
             accepted, reason, pullback_distance = evaluate_candidate_signal(
                 row,
                 previous,
@@ -4699,6 +4985,37 @@ def candidate_replay_strategy(
             "entry_atr_execution_percentile": float(row["atr_execution_percentile"]),
             "pullback_distance_atr": float(pullback_distance or 0.0),
             "entry_zscore": zscore_value,
+            "entry_regime_interval": params.regime_interval,
+            "entry_regime_fast_ema": (
+                float(row["regime_fast_ema"])
+                if pd.notna(row.get("regime_fast_ema"))
+                else None
+            ),
+            "entry_regime_slow_ema": (
+                float(row["regime_slow_ema"])
+                if pd.notna(row.get("regime_slow_ema"))
+                else None
+            ),
+            "entry_regime_slope_pct": (
+                float(row["regime_slope_pct"])
+                if pd.notna(row.get("regime_slope_pct"))
+                else None
+            ),
+            "entry_donchian_high": (
+                float(row["donchian_high"])
+                if pd.notna(row.get("donchian_high"))
+                else None
+            ),
+            "entry_donchian_low": (
+                float(row["donchian_low"])
+                if pd.notna(row.get("donchian_low"))
+                else None
+            ),
+            "entry_volume_ratio": (
+                float(row["volume_ratio"])
+                if pd.notna(row.get("volume_ratio"))
+                else None
+            ),
         }
 
     report = build_candidate_direction_report(trades, params.minimum_train_trades, params)
@@ -4706,10 +5023,8 @@ def candidate_replay_strategy(
         {
             "strategy_id": strategy_id,
             "direction": (
-                "LONG"
-                if strategy_id == CANDIDATE_TREND_LONG_NAME
-                else "SHORT"
-                if strategy_id == CANDIDATE_TREND_SHORT_NAME
+                candidate_strategy_direction(strategy_id)
+                if strategy_id != CANDIDATE_MEAN_REVERSION_NAME
                 else "BOTH"
             ),
             "sizing_mode": sizing_mode,
@@ -5026,11 +5341,7 @@ def apply_risk_sizing_overlay(
     strategy_id: str,
 ) -> Dict[str, Any]:
     equity = float(params.starting_equity_usdt)
-    risk_config = replace(
-        config,
-        max_net_loss_per_trade_usdt=params.executable_max_net_loss_per_trade_usdt,
-        max_risk_per_trade_pct=params.executable_max_risk_per_trade_pct,
-    )
+    risk_config = candidate_risk_config(config, params)
     resized: List[Dict[str, Any]] = []
     skipped: Counter = Counter()
     scale_fields = (
@@ -5060,7 +5371,11 @@ def apply_risk_sizing_overlay(
             stop_loss_pct=stop_loss_pct,
         )
         if sizing.quantity <= 0 or original_quantity <= 0:
-            skipped[sizing.skip_reason or "INVALID_SOURCE_QUANTITY"] += 1
+            skipped[
+                candidate_risk_skip_reason(sizing.skip_reason)
+                if sizing.skip_reason
+                else "INVALID_SOURCE_QUANTITY"
+            ] += 1
             continue
         scale = sizing.quantity / original_quantity
         resized_trade = dict(trade)
@@ -5100,7 +5415,13 @@ def candidate_direction_gate(
     report: Dict[str, Any],
     minimum_trades: int,
     params: CandidateReplayParameters,
+    minimum_net_profit_factor: Optional[float] = None,
 ) -> Dict[str, Any]:
+    profit_factor_threshold = (
+        params.minimum_net_profit_factor
+        if minimum_net_profit_factor is None
+        else minimum_net_profit_factor
+    )
     failures: List[str] = []
     if int(report.get("trades", 0) or 0) < minimum_trades:
         failures.append("INSUFFICIENT_TRADES")
@@ -5108,9 +5429,12 @@ def candidate_direction_gate(
     if expectancy is None or float(expectancy) <= 0:
         failures.append("NON_POSITIVE_EXPECTANCY")
     net_profit_factor = report.get("net_profit_factor")
-    if net_profit_factor is None or float(net_profit_factor) <= params.minimum_net_profit_factor:
+    if net_profit_factor is None or float(net_profit_factor) <= profit_factor_threshold:
         failures.append("NET_PROFIT_FACTOR_BELOW_THRESHOLD")
-    if float(report.get("max_drawdown", 0.0) or 0.0) >= params.maximum_drawdown_usdt:
+    if (
+        params.enforce_fixed_notional_drawdown
+        and float(report.get("max_drawdown", 0.0) or 0.0) >= params.maximum_drawdown_usdt
+    ):
         failures.append("DRAWDOWN_LIMIT_EXCEEDED")
     cost_ratio = report.get("cost_to_gross_profit_ratio")
     if cost_ratio is None or float(cost_ratio) > params.maximum_cost_to_gross_profit_ratio:
@@ -5118,6 +5442,7 @@ def candidate_direction_gate(
     return {
         "eligible": not failures,
         "minimum_trades": minimum_trades,
+        "minimum_net_profit_factor": profit_factor_threshold,
         "failure_reasons": failures,
     }
 
@@ -5126,6 +5451,7 @@ def build_candidate_direction_report(
     trades: Sequence[Dict[str, Any]],
     minimum_trades: int,
     params: CandidateReplayParameters,
+    minimum_net_profit_factor: Optional[float] = None,
 ) -> Dict[str, Any]:
     trade_list = list(trades)
     base = summarize_trade_group(trade_list)
@@ -5144,7 +5470,12 @@ def build_candidate_direction_report(
         ),
         "exit_reason_counts": dict(Counter(str(trade.get("exit_reason", "UNKNOWN")) for trade in trade_list)),
     }
-    report["gate"] = candidate_direction_gate(report, minimum_trades, params)
+    report["gate"] = candidate_direction_gate(
+        report,
+        minimum_trades,
+        params,
+        minimum_net_profit_factor=minimum_net_profit_factor,
+    )
     return report
 
 
@@ -5253,11 +5584,32 @@ def build_walk_forward_strategy_validation(
     window_reports_by_segment: Dict[str, Sequence[Dict[str, Any]]],
     params: CandidateReplayParameters,
 ) -> Dict[str, Any]:
+    minimum_validation_trades = (
+        params.minimum_out_of_sample_trades
+        if params.minimum_validation_trades is None
+        else params.minimum_validation_trades
+    )
+    minimum_train_profit_factor = (
+        params.minimum_net_profit_factor
+        if params.minimum_train_net_profit_factor is None
+        else params.minimum_train_net_profit_factor
+    )
+    minimum_validation_profit_factor = (
+        params.minimum_net_profit_factor
+        if params.minimum_validation_net_profit_factor is None
+        else params.minimum_validation_net_profit_factor
+    )
+    minimum_test_profit_factor = (
+        params.minimum_net_profit_factor
+        if params.minimum_test_net_profit_factor is None
+        else params.minimum_test_net_profit_factor
+    )
     fixed_test_trades = list(fixed_trades_by_segment["test"])
     fixed_report = build_candidate_direction_report(
         fixed_test_trades,
         params.minimum_out_of_sample_trades,
         params,
+        minimum_net_profit_factor=minimum_test_profit_factor,
     )
     cost_stress = build_cost_stress_report(fixed_test_trades, params.cost_stress_multipliers)
     bootstrap = block_bootstrap_expectancy(
@@ -5277,11 +5629,13 @@ def build_walk_forward_strategy_validation(
         fixed_trades_by_segment["train"],
         params.minimum_train_trades,
         params,
+        minimum_net_profit_factor=minimum_train_profit_factor,
     )
     validation_report = build_candidate_direction_report(
         fixed_trades_by_segment["validation"],
-        params.minimum_out_of_sample_trades,
+        minimum_validation_trades,
         params,
+        minimum_net_profit_factor=minimum_validation_profit_factor,
     )
     validation_stress = build_cost_stress_report(
         fixed_trades_by_segment["validation"],
@@ -5301,10 +5655,10 @@ def build_walk_forward_strategy_validation(
         selection_failures.append("NON_POSITIVE_TRAIN_EXPECTANCY")
     if (
         train_report.get("net_profit_factor") is None
-        or float(train_report["net_profit_factor"]) <= params.minimum_net_profit_factor
+        or float(train_report["net_profit_factor"]) <= minimum_train_profit_factor
     ):
         selection_failures.append("TRAIN_NET_PROFIT_FACTOR_BELOW_THRESHOLD")
-    if int(validation_report.get("trades", 0) or 0) < params.minimum_out_of_sample_trades:
+    if int(validation_report.get("trades", 0) or 0) < minimum_validation_trades:
         selection_failures.append("INSUFFICIENT_VALIDATION_TRADES")
     if validation_report.get("expectancy") is None or float(validation_report["expectancy"]) <= 0:
         selection_failures.append("NON_POSITIVE_VALIDATION_EXPECTANCY")
@@ -5317,7 +5671,7 @@ def build_walk_forward_strategy_validation(
         selection_failures.append("VALIDATION_NOT_POSITIVE_IN_MAJORITY_OF_WINDOWS")
     if (
         validation_15x.get("net_profit_factor") is None
-        or float(validation_15x["net_profit_factor"]) <= params.minimum_net_profit_factor
+        or float(validation_15x["net_profit_factor"]) <= minimum_validation_profit_factor
         or float(validation_15x.get("net_pnl", 0.0) or 0.0) <= 0
     ):
         selection_failures.append("VALIDATION_FAILED_1_5X_COST_STRESS")
@@ -5335,18 +5689,26 @@ def build_walk_forward_strategy_validation(
         failures.append("NON_POSITIVE_FIXED_NOTIONAL_EXPECTANCY")
     if (
         stressed_15x.get("net_profit_factor") is None
-        or float(stressed_15x["net_profit_factor"]) <= params.minimum_net_profit_factor
+        or float(stressed_15x["net_profit_factor"]) <= minimum_test_profit_factor
         or float(stressed_15x.get("net_pnl", 0.0) or 0.0) <= 0
     ):
         failures.append("FAILED_1_5X_COST_STRESS")
     if bootstrap.get("lower_95") is None or float(bootstrap["lower_95"]) <= 0:
         failures.append("BOOTSTRAP_EXPECTANCY_LOWER_BOUND_NOT_POSITIVE")
-    if float(fixed_report.get("max_drawdown", 0.0) or 0.0) >= params.maximum_drawdown_usdt:
+    if (
+        params.enforce_fixed_notional_drawdown
+        and float(fixed_report.get("max_drawdown", 0.0) or 0.0) >= params.maximum_drawdown_usdt
+    ):
         failures.append("DRAWDOWN_LIMIT_EXCEEDED")
     if int(risk_report.get("trades", 0) or 0) == 0:
         failures.append("NO_RISK_SIZED_ORDERS_FIT_EXCHANGE_FILTERS")
     elif float(risk_report.get("net_pnl", 0.0) or 0.0) <= 0:
         failures.append("NON_POSITIVE_RISK_SIZED_NET_PNL")
+    if (
+        float(risk_report.get("max_drawdown", 0.0) or 0.0)
+        >= params.maximum_risk_sized_drawdown_usdt
+    ):
+        failures.append("RISK_SIZED_DRAWDOWN_LIMIT_EXCEEDED")
     if (
         params.minimum_risk_sized_coverage > 0
         and float(risk_report.get("execution_coverage", 0.0) or 0.0)
@@ -5410,14 +5772,23 @@ def run_candidate_replay(
     source_seconds = interval_seconds(source_interval)
     execution_seconds = interval_seconds(params.execution_interval)
     trend_seconds = interval_seconds(params.trend_interval)
+    regime_seconds = interval_seconds(params.regime_interval) if params.regime_interval else None
     if source_seconds is None or execution_seconds is None or trend_seconds is None:
         raise ConfigError("Candidate replay intervals are invalid")
     if execution_seconds % source_seconds != 0 or trend_seconds % execution_seconds != 0:
         raise ConfigError("Candidate replay intervals must be exact multiples of each other")
-    warmup_ms = max(
+    if regime_seconds is not None and regime_seconds % execution_seconds != 0:
+        raise ConfigError("Candidate regime interval must be an exact multiple of execution interval")
+    warmup_seconds = max(
         params.atr_percentile_window * execution_seconds,
         (params.trend_slow_ema_period + params.slope_consistency_window + params.trend_atr_period) * trend_seconds,
-    ) * 1000
+    )
+    if regime_seconds is not None:
+        warmup_seconds = max(
+            warmup_seconds,
+            (params.regime_slow_ema_period + params.regime_slope_lookback) * regime_seconds,
+        )
+    warmup_ms = warmup_seconds * 1000
     download_start_ms = int(windows[0]["train"][0]) - warmup_ms - 2 * trend_seconds * 1000
     cache_path = resolve_app_path(cache_file)
     funding_cache_path = resolve_app_path(
@@ -5554,15 +5925,24 @@ def run_candidate_replay(
 
             for segment_name in ("train", "validation", "test"):
                 start_ms, end_ms = window[segment_name]
-                minimum_trades = (
-                    params.minimum_train_trades
-                    if segment_name == "train"
-                    else params.minimum_out_of_sample_trades
-                )
+                if segment_name == "train":
+                    minimum_trades = params.minimum_train_trades
+                    minimum_profit_factor = params.minimum_train_net_profit_factor
+                elif segment_name == "validation":
+                    minimum_trades = (
+                        params.minimum_out_of_sample_trades
+                        if params.minimum_validation_trades is None
+                        else params.minimum_validation_trades
+                    )
+                    minimum_profit_factor = params.minimum_validation_net_profit_factor
+                else:
+                    minimum_trades = params.minimum_out_of_sample_trades
+                    minimum_profit_factor = params.minimum_test_net_profit_factor
                 fixed_report = build_candidate_direction_report(
                     selected_trades[segment_name],
                     minimum_trades,
                     params,
+                    minimum_net_profit_factor=minimum_profit_factor,
                 )
                 fixed_report.update(
                     {
@@ -5639,8 +6019,19 @@ def run_candidate_replay(
                 raw_deduplicated[segment_name],
                 params.minimum_train_trades
                 if segment_name == "train"
-                else params.minimum_out_of_sample_trades,
+                else (
+                    params.minimum_out_of_sample_trades
+                    if segment_name == "test" or params.minimum_validation_trades is None
+                    else params.minimum_validation_trades
+                ),
                 params,
+                minimum_net_profit_factor=(
+                    params.minimum_train_net_profit_factor
+                    if segment_name == "train"
+                    else params.minimum_validation_net_profit_factor
+                    if segment_name == "validation"
+                    else params.minimum_test_net_profit_factor
+                ),
             )
             for segment_name in ("train", "validation", "test")
         }
@@ -5680,6 +6071,7 @@ def run_candidate_replay(
         "source_interval": source_interval,
         "execution_interval": params.execution_interval,
         "trend_interval": params.trend_interval,
+        "regime_interval": params.regime_interval,
         "days": days,
         "shadow_mode_only": True,
         "dry_run": True,
@@ -5717,7 +6109,7 @@ def run_candidate_replay(
         },
         "windows": window_summaries,
         "out_of_sample_validation": validation,
-        "eligible_strategies": [],
+        "eligible_strategies": forward_shadow_candidates,
         "forward_shadow_candidate_strategies": forward_shadow_candidates,
         "viability_status": viability_status,
         "recommendation": (
@@ -5831,6 +6223,7 @@ def run_candidate_portfolio_replay(
         "source_interval": params.source_interval,
         "execution_interval": params.execution_interval,
         "trend_interval": params.trend_interval,
+        "regime_interval": params.regime_interval,
         "strategies": list(params.strategy_ids),
         "symbol_summaries": symbol_summaries,
         "errors": errors,
@@ -5859,7 +6252,7 @@ def run_candidate_portfolio_replay(
 
 def parse_candidate_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run independent rolling walk-forward strategy validation")
-    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V4)
+    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V7)
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--end-time", default=None)
     parser.add_argument("--cache-file", default=None)
@@ -5887,7 +6280,7 @@ def candidate_replay_main(arguments: Sequence[str]) -> None:
 
 def parse_candidate_portfolio_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run cross-symbol candidate robustness validation")
-    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V6)
+    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V7)
     parser.add_argument("--symbols", default="SOLUSDT,BTCUSDT,ETHUSDT,BNBUSDT")
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--end-time", default=None)

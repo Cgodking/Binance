@@ -30,6 +30,7 @@ reports/
 historical_data/
 historical_replay/
 candidate_replay/
+feasibility_scan_v10/
 .deploy/
 .deploy-*/
 deploy_candidate_*/

@@ -2701,6 +2701,154 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             self.assertTrue((output_path / "latest.json").exists())
 
 
+class FeasibilityScannerTests(EnvTestCase):
+    def setUp(self):
+        super().setUp()
+        self.module = reload_bot()
+        self.config = self.module.load_config()
+
+    @staticmethod
+    def symbol_info(symbol, step_size, min_qty, min_notional):
+        return {
+            "symbol": symbol,
+            "status": "TRADING",
+            "contractType": "PERPETUAL",
+            "quoteAsset": "USDT",
+            "marginAsset": "USDT",
+            "quantityPrecision": 6,
+            "pricePrecision": 6,
+            "filters": [
+                {
+                    "filterType": "LOT_SIZE",
+                    "stepSize": str(step_size),
+                    "minQty": str(min_qty),
+                    "maxQty": "1000000",
+                },
+                {
+                    "filterType": "MARKET_LOT_SIZE",
+                    "stepSize": str(step_size),
+                    "minQty": str(min_qty),
+                    "maxQty": "1000000",
+                },
+                {"filterType": "MIN_NOTIONAL", "notional": str(min_notional)},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.000001"},
+            ],
+        }
+
+    def market_payloads(self):
+        exchange_info = {
+            "symbols": [
+                self.symbol_info("LOWUSDT", 0.001, 0.001, 5.0),
+                self.symbol_info("BTCUSDT", 0.001, 0.001, 5.0),
+                self.symbol_info("WIDEUSDT", 0.001, 0.001, 5.0),
+            ]
+        }
+        books = [
+            {"symbol": "LOWUSDT", "bidPrice": "0.99995", "askPrice": "1.00005"},
+            {"symbol": "BTCUSDT", "bidPrice": "99999", "askPrice": "100001"},
+            {"symbol": "WIDEUSDT", "bidPrice": "9.99", "askPrice": "10.01"},
+        ]
+        tickers = [
+            {"symbol": "LOWUSDT", "lastPrice": "1", "quoteVolume": "50000000"},
+            {"symbol": "BTCUSDT", "lastPrice": "100000", "quoteVolume": "1000000000"},
+            {"symbol": "WIDEUSDT", "lastPrice": "10", "quoteVolume": "50000000"},
+        ]
+        return exchange_info, books, tickers
+
+    def test_exchange_filter_parser_falls_back_from_zero_market_step(self):
+        item = self.symbol_info("LOWUSDT", 0.01, 0.01, 5.0)
+        market_lot = next(row for row in item["filters"] if row["filterType"] == "MARKET_LOT_SIZE")
+        market_lot["stepSize"] = "0"
+        market_lot["minQty"] = "0"
+
+        filters = self.module.exchange_filters_from_symbol_info(item)
+
+        self.assertEqual(filters.step_size, 0.01)
+        self.assertEqual(filters.min_qty, 0.01)
+
+    def test_scanner_separates_risk_and_liquidity_rejections(self):
+        exchange_info, books, tickers = self.market_payloads()
+        params = self.module.FeasibilityScanParameters(
+            primary_stop_loss_pct=0.006,
+            stop_loss_scenarios=(0.006, 0.01, 0.015),
+        )
+
+        rows, errors = self.module.build_feasibility_scan_rows(
+            exchange_info,
+            books,
+            tickers,
+            self.config,
+            params,
+        )
+        by_symbol = {row["symbol"]: row for row in rows}
+
+        self.assertEqual(errors, {})
+        self.assertTrue(by_symbol["LOWUSDT"]["primary_feasible"])
+        self.assertFalse(by_symbol["BTCUSDT"]["primary_feasible"])
+        self.assertIn(
+            "MINIMUM_ORDER_EXCEEDS_RISK_BUDGET",
+            by_symbol["BTCUSDT"]["primary_rejection_reasons"],
+        )
+        self.assertFalse(by_symbol["WIDEUSDT"]["primary_feasible"])
+        self.assertIn("BOOK_SPREAD_ABOVE_LIMIT", by_symbol["WIDEUSDT"]["primary_rejection_reasons"])
+        self.assertGreater(by_symbol["LOWUSDT"]["maximum_affordable_stop_loss_pct"], 0.006)
+        self.assertFalse(
+            by_symbol["LOWUSDT"]["stop_loss_scenarios"]["stop_0.010000"]["feasible"]
+        )
+
+    def test_run_scanner_uses_public_endpoints_and_writes_reports(self):
+        exchange_info, books, tickers = self.market_payloads()
+
+        class FakePublicClient:
+            def __init__(self):
+                self.calls = []
+
+            def futures_exchange_info(self):
+                self.calls.append("exchange_info")
+                return exchange_info
+
+            def futures_orderbook_ticker(self):
+                self.calls.append("orderbook")
+                return books
+
+            def futures_ticker(self):
+                self.calls.append("ticker")
+                return tickers
+
+        client = FakePublicClient()
+        params = self.module.FeasibilityScanParameters(
+            primary_stop_loss_pct=0.006,
+            stop_loss_scenarios=(0.006, 0.01),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = self.module.run_feasibility_scan(
+                self.config,
+                params,
+                temp_dir,
+                client=client,
+            )
+            output_path = Path(temp_dir)
+
+            self.assertTrue((output_path / "latest.json").exists())
+            self.assertTrue((output_path / "latest.csv").exists())
+            self.assertEqual(len(list(output_path.glob("history_*.json"))), 1)
+            self.assertEqual(len(list(output_path.glob("history_*.csv"))), 1)
+
+        self.assertEqual(client.calls, ["exchange_info", "orderbook", "ticker"])
+        self.assertEqual(report["recommended_research_symbols"], ["LOWUSDT"])
+        self.assertFalse(report["api_credentials_used"])
+        self.assertFalse(report["account_state_changed"])
+        self.assertFalse(report["live_trading"])
+        self.assertEqual(report["research_decision"], "RESEARCH_UNIVERSE_AVAILABLE")
+
+    def test_scanner_rejects_any_non_shadow_configuration(self):
+        params = self.module.FeasibilityScanParameters()
+        unsafe_config = self.module.replace(self.config, live_trading=True)
+
+        with self.assertRaises(self.module.ConfigError):
+            self.module.run_feasibility_scan(unsafe_config, params, "unused", client=object())
+
+
 class LiveSafetyTests(EnvTestCase):
     def test_place_market_order_never_calls_client_in_shadow_only_engine(self):
         module = reload_bot()

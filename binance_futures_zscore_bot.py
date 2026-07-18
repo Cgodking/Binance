@@ -55,6 +55,7 @@ CANDIDATE_PROFILE_V6 = "v6_long_cost_gate_30m_2h"
 CANDIDATE_PROFILE_V7 = "v7_cost_aware_breakout_15m_1h_4h"
 CANDIDATE_PROFILE_V8 = "v8_cost_aware_pullback_15m_1h_4h"
 CANDIDATE_PROFILE_V9 = "v9_cross_asset_pullback_15m_1h_4h"
+FEASIBILITY_SCAN_PROFILE = "v10_feasibility_universe_scanner"
 CANDIDATE_REPLAY_PROFILES = (
     CANDIDATE_PROFILE_V3,
     CANDIDATE_PROFILE_V4,
@@ -636,6 +637,18 @@ class ExchangeFilters:
     min_notional: float
     quantity_precision: int
     price_precision: int
+
+
+@dataclass(frozen=True)
+class FeasibilityScanParameters:
+    balance_usdt: float = 5.0
+    max_net_loss_usdt: float = 0.05
+    max_risk_pct: float = 0.01
+    primary_stop_loss_pct: float = 0.01
+    stop_loss_scenarios: Tuple[float, ...] = (0.006, 0.01, 0.015)
+    minimum_quote_volume_usdt: float = 10_000_000.0
+    maximum_book_spread_pct: float = 0.001
+    recommended_symbol_limit: int = 25
 
 
 @dataclass(frozen=True)
@@ -1447,6 +1460,25 @@ def exchange_filters_from_dict(payload: Dict[str, Any]) -> ExchangeFilters:
     )
 
 
+def exchange_filters_from_symbol_info(item: Dict[str, Any]) -> ExchangeFilters:
+    filters = {entry.get("filterType"): entry for entry in item.get("filters", [])}
+    lot = filters.get("LOT_SIZE", {})
+    market_lot = filters.get("MARKET_LOT_SIZE", {})
+    market_step = float(market_lot.get("stepSize", "0") or 0.0)
+    lot_source = market_lot if market_step > 0 else lot
+    notional = filters.get("MIN_NOTIONAL", {})
+    price_filter = filters.get("PRICE_FILTER", {})
+    return ExchangeFilters(
+        step_size=float(lot_source.get("stepSize", lot.get("stepSize", "0.001"))),
+        tick_size=float(price_filter.get("tickSize", "0.01")),
+        min_qty=float(lot_source.get("minQty", lot.get("minQty", "0.0"))),
+        max_qty=float(lot_source.get("maxQty", lot.get("maxQty", "100000000"))),
+        min_notional=float(notional.get("notional", notional.get("minNotional", "0.0"))),
+        quantity_precision=int(item.get("quantityPrecision", 3)),
+        price_precision=int(item.get("pricePrecision", 2)),
+    )
+
+
 def load_cached_exchange_filters(symbol: str, cache_file: str) -> Optional[ExchangeFilters]:
     path = Path(cache_file)
     if not path.exists():
@@ -1510,25 +1542,7 @@ def get_exchange_filters(client: Any, symbol: str, config: Optional[Config] = No
     for item in info.get("symbols", []):
         if item.get("symbol") != symbol:
             continue
-        filters = {entry.get("filterType"): entry for entry in item.get("filters", [])}
-        lot = filters.get("LOT_SIZE", {})
-        market_lot = filters.get("MARKET_LOT_SIZE", {})
-        notional = filters.get("MIN_NOTIONAL", {})
-        price_filter = filters.get("PRICE_FILTER", {})
-        step_size = float((market_lot or lot).get("stepSize", lot.get("stepSize", "0.001")))
-        min_qty = float((market_lot or lot).get("minQty", lot.get("minQty", "0.0")))
-        max_qty = float((market_lot or lot).get("maxQty", lot.get("maxQty", "100000000")))
-        min_notional = float(notional.get("notional", notional.get("minNotional", "0.0")))
-        tick_size = float(price_filter.get("tickSize", "0.01"))
-        parsed = ExchangeFilters(
-            step_size=step_size,
-            tick_size=tick_size,
-            min_qty=min_qty,
-            max_qty=max_qty,
-            min_notional=min_notional,
-            quantity_precision=int(item.get("quantityPrecision", 3)),
-            price_precision=int(item.get("pricePrecision", 2)),
-        )
+        parsed = exchange_filters_from_symbol_info(item)
         save_cached_exchange_filters(symbol, parsed, cache_file)
         return parsed
     raise ConfigError(f"Symbol {symbol} was not found in futures exchange info")
@@ -4008,6 +4022,297 @@ def build_public_replay_client(config: Config) -> Any:
         return Client(None, None, **kwargs)
 
 
+def public_market_rows_by_symbol(payload: Any) -> Dict[str, Dict[str, Any]]:
+    rows = payload if isinstance(payload, list) else [payload]
+    return {
+        str(row.get("symbol", "")).upper(): row
+        for row in rows
+        if isinstance(row, dict) and row.get("symbol")
+    }
+
+
+def feasibility_scenario_key(stop_loss_pct: float) -> str:
+    return f"stop_{float(stop_loss_pct):.6f}"
+
+
+def validate_feasibility_scan_parameters(params: FeasibilityScanParameters) -> None:
+    if params.balance_usdt <= 0:
+        raise ConfigError("Feasibility scan balance must be positive")
+    if params.max_net_loss_usdt <= 0 or not 0 < params.max_risk_pct <= 1:
+        raise ConfigError("Feasibility scan risk limits are invalid")
+    if params.primary_stop_loss_pct <= 0:
+        raise ConfigError("Feasibility scan primary stop loss must be positive")
+    if not params.stop_loss_scenarios or any(value <= 0 for value in params.stop_loss_scenarios):
+        raise ConfigError("Feasibility scan stop loss scenarios must be positive")
+    if params.minimum_quote_volume_usdt < 0 or params.maximum_book_spread_pct < 0:
+        raise ConfigError("Feasibility scan liquidity limits cannot be negative")
+    if params.recommended_symbol_limit <= 0:
+        raise ConfigError("Feasibility scan symbol limit must be positive")
+
+
+def build_feasibility_scan_rows(
+    exchange_info: Dict[str, Any],
+    orderbook_tickers: Any,
+    market_tickers: Any,
+    config: Config,
+    params: FeasibilityScanParameters,
+) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    validate_feasibility_scan_parameters(params)
+    books = public_market_rows_by_symbol(orderbook_tickers)
+    tickers = public_market_rows_by_symbol(market_tickers)
+    scenario_values = tuple(sorted(set(params.stop_loss_scenarios + (params.primary_stop_loss_pct,))))
+    rows: List[Dict[str, Any]] = []
+    errors: Dict[str, str] = {}
+
+    for item in exchange_info.get("symbols", []):
+        symbol = str(item.get("symbol", "")).upper()
+        if (
+            not symbol
+            or item.get("status") != "TRADING"
+            or item.get("contractType") != "PERPETUAL"
+            or item.get("quoteAsset") != "USDT"
+            or item.get("marginAsset") != "USDT"
+        ):
+            continue
+        try:
+            filters = exchange_filters_from_symbol_info(item)
+            if filters.step_size <= 0 or filters.max_qty <= 0:
+                raise ConfigError("invalid quantity filters")
+            book = books.get(symbol, {})
+            ticker = tickers.get(symbol, {})
+            bid_price = float(book.get("bidPrice", 0.0) or 0.0)
+            ask_price = float(book.get("askPrice", 0.0) or 0.0)
+            last_price = float(ticker.get("lastPrice", 0.0) or 0.0)
+            if bid_price > 0 and ask_price >= bid_price:
+                price = (bid_price + ask_price) / 2.0
+                book_spread_pct = (ask_price - bid_price) / price
+            elif last_price > 0:
+                price = last_price
+                book_spread_pct = float("nan")
+            else:
+                raise ConfigError("missing valid public price")
+            quote_volume = float(ticker.get("quoteVolume", 0.0) or 0.0)
+            if quote_volume <= 0:
+                base_volume = float(ticker.get("volume", 0.0) or 0.0)
+                quote_volume = base_volume * price
+
+            observed_per_side_spread_bps = (
+                book_spread_pct * 5000.0 if math.isfinite(book_spread_pct) else 0.0
+            )
+            scan_config = replace(
+                config,
+                max_net_loss_per_trade_usdt=params.max_net_loss_usdt,
+                max_risk_per_trade_pct=params.max_risk_pct,
+                shadow_spread_bps=max(config.shadow_spread_bps, observed_per_side_spread_bps),
+            )
+            risk_budget = min(params.max_net_loss_usdt, params.balance_usdt * params.max_risk_pct)
+            minimum_quantity = decimal_ceil(
+                max(filters.min_qty, filters.min_notional / price),
+                filters.step_size,
+            )
+            minimum_valid_notional = minimum_quantity * price
+            non_stop_loss_rate = (
+                scan_config.gap_risk_buffer_pct + round_trip_execution_cost_rate(scan_config)
+            )
+            maximum_affordable_stop_loss_pct = max(
+                0.0,
+                risk_budget / minimum_valid_notional - non_stop_loss_rate,
+            ) if minimum_valid_notional > 0 else 0.0
+
+            scenario_results: Dict[str, Dict[str, Any]] = {}
+            for stop_loss_pct in scenario_values:
+                plan = build_risk_sizing_plan(
+                    params.balance_usdt,
+                    price,
+                    filters,
+                    scan_config,
+                    stop_loss_pct=stop_loss_pct,
+                )
+                liquidity_reasons: List[str] = []
+                if not math.isfinite(book_spread_pct):
+                    liquidity_reasons.append("MISSING_ORDERBOOK_SPREAD")
+                elif book_spread_pct > params.maximum_book_spread_pct:
+                    liquidity_reasons.append("BOOK_SPREAD_ABOVE_LIMIT")
+                if quote_volume < params.minimum_quote_volume_usdt:
+                    liquidity_reasons.append("QUOTE_VOLUME_BELOW_LIMIT")
+                rejection_reasons = ([plan.skip_reason] if plan.skip_reason else []) + liquidity_reasons
+                scenario_results[feasibility_scenario_key(stop_loss_pct)] = {
+                    "stop_loss_pct": stop_loss_pct,
+                    "quantity": plan.quantity,
+                    "target_notional_usdt": plan.target_notional,
+                    "estimated_net_loss_usdt": plan.estimated_net_loss_usdt,
+                    "minimum_order_estimated_loss_usdt": plan.minimum_order_estimated_loss_usdt,
+                    "risk_budget_usdt": plan.risk_budget_usdt,
+                    "risk_budget_usage": (
+                        plan.minimum_order_estimated_loss_usdt / risk_budget if risk_budget > 0 else None
+                    ),
+                    "risk_sizing_skip_reason": plan.skip_reason,
+                    "rejection_reasons": rejection_reasons,
+                    "feasible": not rejection_reasons,
+                }
+
+            primary = scenario_results[feasibility_scenario_key(params.primary_stop_loss_pct)]
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "price": price,
+                    "bid_price": bid_price,
+                    "ask_price": ask_price,
+                    "book_spread_pct": book_spread_pct if math.isfinite(book_spread_pct) else None,
+                    "quote_volume_24h_usdt": quote_volume,
+                    "step_size": filters.step_size,
+                    "min_qty": filters.min_qty,
+                    "max_qty": filters.max_qty,
+                    "min_notional_filter_usdt": filters.min_notional,
+                    "minimum_valid_quantity": minimum_quantity,
+                    "minimum_valid_notional_usdt": minimum_valid_notional,
+                    "risk_budget_usdt": risk_budget,
+                    "maximum_affordable_stop_loss_pct": maximum_affordable_stop_loss_pct,
+                    "primary_stop_loss_pct": params.primary_stop_loss_pct,
+                    "minimum_order_estimated_loss_usdt": primary["minimum_order_estimated_loss_usdt"],
+                    "risk_budget_usage": primary["risk_budget_usage"],
+                    "primary_rejection_reasons": primary["rejection_reasons"],
+                    "primary_feasible": primary["feasible"],
+                    "stop_loss_scenarios": scenario_results,
+                }
+            )
+        except Exception as exc:
+            errors[symbol or f"UNKNOWN_{len(errors) + 1}"] = str(exc)
+
+    rows.sort(
+        key=lambda row: (
+            not bool(row["primary_feasible"]),
+            -float(row["quote_volume_24h_usdt"]),
+            float(row["book_spread_pct"] if row["book_spread_pct"] is not None else math.inf),
+        )
+    )
+    return rows, errors
+
+
+def write_feasibility_scan_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    fieldnames = [
+        "symbol",
+        "price",
+        "bid_price",
+        "ask_price",
+        "book_spread_pct",
+        "quote_volume_24h_usdt",
+        "step_size",
+        "min_qty",
+        "max_qty",
+        "min_notional_filter_usdt",
+        "minimum_valid_quantity",
+        "minimum_valid_notional_usdt",
+        "risk_budget_usdt",
+        "maximum_affordable_stop_loss_pct",
+        "primary_stop_loss_pct",
+        "minimum_order_estimated_loss_usdt",
+        "risk_budget_usage",
+        "primary_feasible",
+        "primary_rejection_reasons",
+        "stop_loss_scenarios",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for source in rows:
+            row = dict(source)
+            row["primary_rejection_reasons"] = ";".join(source["primary_rejection_reasons"])
+            row["stop_loss_scenarios"] = json.dumps(
+                source["stop_loss_scenarios"], sort_keys=True, allow_nan=False
+            )
+            writer.writerow(row)
+    os.replace(temp_path, path)
+
+
+def run_feasibility_scan(
+    config: Config,
+    params: FeasibilityScanParameters,
+    output_dir_value: str,
+    client: Any = None,
+) -> Dict[str, Any]:
+    if config.live_trading or not config.dry_run or not config.shadow_mode:
+        raise ConfigError("Feasibility scan requires LIVE_TRADING=false, DRY_RUN=true, and SHADOW_MODE=true")
+    validate_feasibility_scan_parameters(params)
+    public_client = client or build_public_replay_client(config)
+    exchange_info = retry_api_call(
+        "Fetch futures exchange info for feasibility scan",
+        public_client.futures_exchange_info,
+        attempts=config.retry_attempts,
+    )
+    orderbook_tickers = retry_api_call(
+        "Fetch futures order book tickers for feasibility scan",
+        public_client.futures_orderbook_ticker,
+        attempts=config.retry_attempts,
+    )
+    market_tickers = retry_api_call(
+        "Fetch futures 24h tickers for feasibility scan",
+        public_client.futures_ticker,
+        attempts=config.retry_attempts,
+    )
+    rows, errors = build_feasibility_scan_rows(
+        exchange_info,
+        orderbook_tickers,
+        market_tickers,
+        config,
+        params,
+    )
+    feasible_rows = [row for row in rows if row["primary_feasible"]]
+    recommended_rows = feasible_rows[: params.recommended_symbol_limit]
+    scenario_summary: Dict[str, Dict[str, Any]] = {}
+    scenario_values = tuple(sorted(set(params.stop_loss_scenarios + (params.primary_stop_loss_pct,))))
+    for stop_loss_pct in scenario_values:
+        key = feasibility_scenario_key(stop_loss_pct)
+        feasible_symbols = [row["symbol"] for row in rows if row["stop_loss_scenarios"][key]["feasible"]]
+        scenario_summary[key] = {
+            "stop_loss_pct": stop_loss_pct,
+            "feasible_symbol_count": len(feasible_symbols),
+            "feasible_symbols": feasible_symbols[: params.recommended_symbol_limit],
+        }
+
+    generated_at = utc_now_text()
+    report = {
+        "engine": FEASIBILITY_SCAN_PROFILE,
+        "generated_at": generated_at,
+        "parameters": asdict(params),
+        "cost_assumptions": {
+            "taker_fee_rate_per_side": config.taker_fee_rate,
+            "minimum_slippage_bps_per_side": config.shadow_slippage_bps,
+            "minimum_spread_bps_per_side": config.shadow_spread_bps,
+            "gap_risk_buffer_pct": config.gap_risk_buffer_pct,
+            "observed_book_spread_used_when_higher": True,
+        },
+        "analyzed_symbol_count": len(rows),
+        "market_data_error_count": len(errors),
+        "market_data_errors": errors,
+        "primary_feasible_symbol_count": len(feasible_rows),
+        "recommended_research_symbols": [row["symbol"] for row in recommended_rows],
+        "scenario_summary": scenario_summary,
+        "rows": rows,
+        "research_decision": (
+            "RESEARCH_UNIVERSE_AVAILABLE"
+            if recommended_rows
+            else "NO_FEASIBLE_UNIVERSE_AT_PRIMARY_STOP"
+        ),
+        "shadow_mode_only": True,
+        "dry_run": True,
+        "live_trading": False,
+        "api_credentials_used": False,
+        "account_state_changed": False,
+        "eligible_for_micro_live_test": False,
+        "source_sha256": file_sha256(Path(__file__).resolve()),
+    }
+    output_dir = resolve_app_path(output_dir_value)
+    compact_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    write_json_atomic(output_dir / "latest.json", report)
+    write_json_atomic(output_dir / f"history_{compact_timestamp}.json", report)
+    write_feasibility_scan_csv(output_dir / "latest.csv", rows)
+    write_feasibility_scan_csv(output_dir / f"history_{compact_timestamp}.csv", rows)
+    return report
+
+
 def run_historical_replay(
     config: Config,
     days: int,
@@ -6450,6 +6755,51 @@ def candidate_portfolio_replay_main(arguments: Sequence[str]) -> None:
     print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
 
 
+def parse_feasibility_stop_scenarios(value: str) -> Tuple[float, ...]:
+    try:
+        values = tuple(float(item.strip()) for item in str(value).split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Stop scenarios must be comma-separated decimal values") from exc
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("Stop scenarios must contain positive values")
+    return values
+
+
+def parse_feasibility_scan_args(arguments: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Scan the public USD-M perpetual universe for risk feasibility")
+    parser.add_argument("--balance", type=float, default=5.0)
+    parser.add_argument("--max-net-loss", type=float, default=0.05)
+    parser.add_argument("--max-risk-pct", type=float, default=0.01)
+    parser.add_argument("--primary-stop-pct", type=float, default=0.01)
+    parser.add_argument(
+        "--stop-scenarios",
+        type=parse_feasibility_stop_scenarios,
+        default=(0.006, 0.01, 0.015),
+    )
+    parser.add_argument("--minimum-quote-volume", type=float, default=10_000_000.0)
+    parser.add_argument("--maximum-book-spread-pct", type=float, default=0.001)
+    parser.add_argument("--recommended-symbol-limit", type=int, default=25)
+    parser.add_argument("--output-dir", default="feasibility_scan_v10")
+    return parser.parse_args(list(arguments))
+
+
+def feasibility_scan_main(arguments: Sequence[str]) -> None:
+    args = parse_feasibility_scan_args(arguments)
+    config = load_config()
+    params = FeasibilityScanParameters(
+        balance_usdt=args.balance,
+        max_net_loss_usdt=args.max_net_loss,
+        max_risk_pct=args.max_risk_pct,
+        primary_stop_loss_pct=args.primary_stop_pct,
+        stop_loss_scenarios=args.stop_scenarios,
+        minimum_quote_volume_usdt=args.minimum_quote_volume,
+        maximum_book_spread_pct=args.maximum_book_spread_pct,
+        recommended_symbol_limit=args.recommended_symbol_limit,
+    )
+    report = run_feasibility_scan(config, params, args.output_dir)
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+
+
 def render_history_plot(state: RuntimeState, plot_type: str) -> bytes:
     import matplotlib
 
@@ -7883,6 +8233,9 @@ def main() -> None:
             return
         if len(sys.argv) > 1 and sys.argv[1] == "candidate-portfolio-replay":
             candidate_portfolio_replay_main(sys.argv[2:])
+            return
+        if len(sys.argv) > 1 and sys.argv[1] == "feasibility-scan":
+            feasibility_scan_main(sys.argv[2:])
             return
         config = load_config()
         state = RuntimeState(state_file=config.bot_state_file)

@@ -2896,6 +2896,197 @@ class FeasibilityScannerTests(EnvTestCase):
             self.module.run_feasibility_scan(unsafe_config, params, "unused", client=object())
 
 
+class MomentumRotationV10Tests(EnvTestCase):
+    def setUp(self):
+        super().setUp()
+        self.module = reload_bot()
+        self.config = self.module.load_config()
+        self.symbols = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT")
+        self.params = self.module.replace(
+            self.module.MomentumRotationParameters(),
+            symbols=self.symbols,
+            minimum_absolute_score=1.0,
+            capital_scenarios_usdt=(5.0, 7.5, 10.0, 15.0),
+        )
+        self.filters = {
+            symbol: self.module.ExchangeFilters(
+                step_size=0.001,
+                tick_size=0.01,
+                min_qty=0.001,
+                max_qty=100000.0,
+                min_notional=5.0,
+                quantity_precision=3,
+                price_precision=2,
+            )
+            for symbol in self.symbols
+        }
+
+    def historical_frame(self, count=240):
+        interval_ms = 4 * 60 * 60 * 1000
+        rows = []
+        for index in range(count):
+            close = 100.0 + index * 0.08 + (index % 7) * 0.03
+            open_time = index * interval_ms
+            rows.append(
+                {
+                    "open_time": open_time,
+                    "open": close - 0.02,
+                    "high": close + 0.15,
+                    "low": close - 0.15,
+                    "close": close,
+                    "volume": 1000.0 + index,
+                    "close_time": open_time + interval_ms - 1,
+                }
+            )
+        return self.module.pd.DataFrame(rows)
+
+    def execution_features(self):
+        interval_ms = 4 * 60 * 60 * 1000
+        first_close = 24 * 60 * 60 * 1000 - 1
+        second_close = first_close + interval_ms
+        features = {}
+        for symbol_index, symbol in enumerate(self.symbols):
+            score = 2.0 - symbol_index * 0.2
+            second_open = 100.0 if symbol_index == 0 else 50.0
+            features[symbol] = self.module.pd.DataFrame(
+                [
+                    {
+                        "open_time": first_close - interval_ms + 1,
+                        "open": second_open - 0.2,
+                        "high": second_open + 0.5,
+                        "low": second_open - 0.5,
+                        "close": second_open,
+                        "volume": 1000.0,
+                        "close_time": first_close,
+                        "momentum_score": score,
+                        "fast_return": 0.10,
+                        "slow_return": 0.20,
+                        "realized_volatility": 0.02,
+                        "ema": second_open - 1.0,
+                        "atr": 0.5,
+                        "trend_side": 1,
+                    },
+                    {
+                        "open_time": first_close + 1,
+                        "open": second_open,
+                        "high": 103.0 if symbol_index == 0 else second_open + 0.5,
+                        "low": 99.5 if symbol_index == 0 else second_open - 0.5,
+                        "close": 102.6 if symbol_index == 0 else second_open,
+                        "volume": 1100.0,
+                        "close_time": second_close,
+                        "momentum_score": score,
+                        "fast_return": 0.10,
+                        "slow_return": 0.20,
+                        "realized_volatility": 0.02,
+                        "ema": second_open - 1.0,
+                        "atr": 0.5,
+                        "trend_side": 1,
+                    },
+                ]
+            )
+        return features, first_close, second_close
+
+    def test_feature_calculation_does_not_read_future_candles(self):
+        source = self.historical_frame()
+        original = self.module.build_momentum_feature_frame(source, self.params)
+        mutated = source.copy()
+        mutated.loc[mutated.index > 200, "close"] *= 4.0
+        changed = self.module.build_momentum_feature_frame(mutated, self.params)
+
+        self.assertAlmostEqual(
+            float(original.loc[200, "momentum_score"]),
+            float(changed.loc[200, "momentum_score"]),
+        )
+        self.assertNotAlmostEqual(
+            float(original.loc[220, "momentum_score"]),
+            float(changed.loc[220, "momentum_score"]),
+        )
+
+    def test_snapshot_ranks_only_aligned_closed_candles(self):
+        features, first_close, _ = self.execution_features()
+
+        candidates = self.module.momentum_snapshot_candidates(features, first_close, self.params)
+
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(candidates[0]["symbol"], "AAAUSDT")
+        self.assertEqual(candidates[0]["cross_section_rank"], 1)
+        self.assertEqual(candidates[0]["universe_size"], 4)
+        self.assertEqual(candidates[0]["side"], "LONG")
+
+    def test_same_candle_stop_and_target_uses_stop_and_gap_uses_open(self):
+        position = {"side": "LONG", "stop_price": 99.0, "take_profit_price": 102.5}
+        both = {"open": 100.0, "high": 103.0, "low": 98.0}
+        gap = {"open": 98.0, "high": 100.0, "low": 97.0}
+
+        self.assertEqual(
+            self.module.momentum_exit_decision(position, both),
+            (99.0, "STOP_LOSS", False),
+        )
+        self.assertEqual(
+            self.module.momentum_exit_decision(position, gap),
+            (98.0, "STOP_LOSS", True),
+        )
+
+    def test_signal_enters_next_open_and_portfolio_holds_one_position(self):
+        features, first_close, second_close = self.execution_features()
+        result = self.module.momentum_rotation_replay(
+            self.config,
+            self.filters,
+            features,
+            {symbol: self.module.pd.DataFrame() for symbol in self.symbols},
+            first_close,
+            second_close + 1,
+            self.params,
+        )
+
+        self.assertEqual(len(result["trades"]), 1)
+        trade = result["trades"][0]
+        self.assertEqual(trade["symbol"], "AAAUSDT")
+        self.assertEqual(trade["side"], "LONG")
+        self.assertEqual(trade["entry_time_ms"], first_close + 1)
+        self.assertEqual(trade["entry_price"], 100.0)
+        self.assertEqual(trade["exit_reason"], "TAKE_PROFIT")
+        self.assertEqual(result["report"]["accepted_signals"], 1)
+
+    def test_capital_overlay_explores_minimum_without_live_orders(self):
+        features, first_close, second_close = self.execution_features()
+        fixed = self.module.momentum_rotation_replay(
+            self.config,
+            self.filters,
+            features,
+            {symbol: self.module.pd.DataFrame() for symbol in self.symbols},
+            first_close,
+            second_close + 1,
+            self.params,
+        )["trades"]
+
+        five = self.module.momentum_capital_overlay(
+            fixed, self.filters, self.config, self.params, 5.0
+        )["report"]
+        seven_fifty = self.module.momentum_capital_overlay(
+            fixed, self.filters, self.config, self.params, 7.5
+        )["report"]
+
+        self.assertEqual(five["trades"], 0)
+        self.assertEqual(five["execution_coverage"], 0.0)
+        self.assertEqual(seven_fifty["trades"], 1)
+        self.assertEqual(seven_fifty["execution_coverage"], 1.0)
+
+    def test_runner_refuses_non_shadow_configuration_before_client_use(self):
+        unsafe = self.module.replace(self.config, live_trading=True)
+
+        with self.assertRaises(self.module.ConfigError):
+            self.module.run_momentum_rotation_replay(
+                unsafe,
+                days=720,
+                end_time=None,
+                cache_dir_value="unused",
+                output_dir_value="unused",
+                params=self.params,
+                client=object(),
+            )
+
+
 class LiveSafetyTests(EnvTestCase):
     def test_place_market_order_never_calls_client_in_shadow_only_engine(self):
         module = reload_bot()

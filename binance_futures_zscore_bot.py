@@ -56,6 +56,8 @@ CANDIDATE_PROFILE_V7 = "v7_cost_aware_breakout_15m_1h_4h"
 CANDIDATE_PROFILE_V8 = "v8_cost_aware_pullback_15m_1h_4h"
 CANDIDATE_PROFILE_V9 = "v9_cross_asset_pullback_15m_1h_4h"
 FEASIBILITY_SCAN_PROFILE = "v10_feasibility_universe_scanner"
+V10_MOMENTUM_PROFILE = "v10_cross_sectional_momentum_rotation_4h"
+V10_MOMENTUM_STRATEGY = "CROSS_SECTIONAL_MOMENTUM_ROTATION_V10"
 CANDIDATE_REPLAY_PROFILES = (
     CANDIDATE_PROFILE_V3,
     CANDIDATE_PROFILE_V4,
@@ -284,6 +286,12 @@ CANDIDATE_TRADE_FIELDNAMES = [
     "holding_seconds",
     "exit_reason",
     "result",
+    "entry_momentum_score",
+    "entry_fast_return",
+    "entry_slow_return",
+    "entry_realized_volatility",
+    "entry_cross_section_rank",
+    "entry_universe_size",
     "symbol",
 ]
 
@@ -659,6 +667,58 @@ class FeasibilityScanParameters:
     minimum_quote_volume_usdt: float = 10_000_000.0
     maximum_book_spread_pct: float = 0.001
     recommended_symbol_limit: int = 25
+
+
+@dataclass(frozen=True)
+class MomentumRotationParameters:
+    strategy_name: str = V10_MOMENTUM_STRATEGY
+    profile_name: str = V10_MOMENTUM_PROFILE
+    default_replay_days: int = 720
+    interval: str = "4h"
+    symbols: Tuple[str, ...] = (
+        "SOLUSDT",
+        "BNBUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+        "ADAUSDT",
+        "ZECUSDT",
+    )
+    fast_momentum_bars: int = 42
+    slow_momentum_bars: int = 180
+    volatility_lookback_bars: int = 42
+    ema_period: int = 50
+    minimum_cross_section_size: int = 4
+    minimum_absolute_score: float = 1.0
+    stop_loss_atr_multiple: float = 1.5
+    reward_to_risk_multiple: float = 2.5
+    minimum_stop_loss_pct: float = 0.01
+    maximum_stop_loss_pct: float = 0.03
+    maximum_holding_bars: int = 42
+    fixed_notional_usdt: float = 100.0
+    capital_scenarios_usdt: Tuple[float, ...] = (5.0, 7.5, 10.0, 15.0)
+    qualification_capital_usdt: float = 10.0
+    max_risk_pct: float = 0.01
+    max_account_margin_fraction: float = 0.50
+    anticipated_funding_cost_pct: float = 0.0003
+    minimum_reward_to_cost_ratio: float = 5.0
+    walk_forward_train_days: int = 180
+    walk_forward_validation_days: int = 90
+    walk_forward_test_days: int = 90
+    walk_forward_step_days: int = 90
+    embargo_minutes: int = 7 * 24 * 60
+    minimum_walk_forward_windows: int = 5
+    minimum_train_trades: int = 20
+    minimum_validation_trades: int = 10
+    minimum_test_trades: int = 30
+    minimum_train_profit_factor: float = 1.20
+    minimum_validation_profit_factor: float = 1.15
+    minimum_test_profit_factor: float = 1.15
+    minimum_positive_test_window_fraction: float = 0.60
+    minimum_capital_execution_coverage: float = 0.80
+    maximum_qualification_drawdown_usdt: float = 0.20
+    cost_stress_multipliers: Tuple[float, ...] = (1.0, 1.5, 2.0)
+    bootstrap_samples: int = 1000
+    bootstrap_block_trades: int = 8
 
 
 @dataclass(frozen=True)
@@ -4423,6 +4483,824 @@ def run_feasibility_scan(
     return report
 
 
+def validate_momentum_rotation_parameters(params: MomentumRotationParameters) -> None:
+    if len(params.symbols) < params.minimum_cross_section_size:
+        raise ConfigError("V10 momentum universe is smaller than the minimum cross-section")
+    if len(set(params.symbols)) != len(params.symbols):
+        raise ConfigError("V10 momentum universe contains duplicate symbols")
+    if any(not str(symbol).endswith("USDT") for symbol in params.symbols):
+        raise ConfigError("V10 momentum universe must contain only USDT symbols")
+    if params.interval != "4h":
+        raise ConfigError("V10 momentum interval is frozen at 4h")
+    if min(
+        params.fast_momentum_bars,
+        params.slow_momentum_bars,
+        params.volatility_lookback_bars,
+        params.ema_period,
+        params.maximum_holding_bars,
+    ) <= 0:
+        raise ConfigError("V10 momentum lookbacks must be positive")
+    if params.fast_momentum_bars >= params.slow_momentum_bars:
+        raise ConfigError("V10 fast momentum lookback must be shorter than slow momentum")
+    if not 0 < params.max_risk_pct <= 1 or not 0 < params.max_account_margin_fraction <= 1:
+        raise ConfigError("V10 capital risk limits are invalid")
+    if params.qualification_capital_usdt not in params.capital_scenarios_usdt:
+        raise ConfigError("V10 qualification capital must be one of the frozen capital scenarios")
+    if params.minimum_stop_loss_pct <= 0 or params.maximum_stop_loss_pct < params.minimum_stop_loss_pct:
+        raise ConfigError("V10 stop loss bounds are invalid")
+    if params.reward_to_risk_multiple <= 1:
+        raise ConfigError("V10 reward-to-risk multiple must exceed one")
+
+
+def build_momentum_feature_frame(
+    frame: pd.DataFrame,
+    params: MomentumRotationParameters,
+) -> pd.DataFrame:
+    validate_momentum_rotation_parameters(params)
+    features = frame[HISTORICAL_KLINE_COLUMNS].copy().sort_values("close_time").reset_index(drop=True)
+    for column in ("open", "high", "low", "close", "volume"):
+        features[column] = pd.to_numeric(features[column], errors="coerce")
+    close = features["close"].astype(float)
+    log_return = np.log(close / close.shift(1))
+    per_bar_volatility = log_return.rolling(params.volatility_lookback_bars).std(ddof=0)
+    fast_risk = per_bar_volatility * math.sqrt(params.fast_momentum_bars)
+    slow_risk = per_bar_volatility * math.sqrt(params.slow_momentum_bars)
+    features["fast_return"] = close.pct_change(params.fast_momentum_bars)
+    features["slow_return"] = close.pct_change(params.slow_momentum_bars)
+    features["realized_volatility"] = per_bar_volatility
+    features["momentum_score"] = (
+        0.40 * features["fast_return"] / fast_risk.replace(0.0, np.nan)
+        + 0.60 * features["slow_return"] / slow_risk.replace(0.0, np.nan)
+    )
+    features["ema"] = close.ewm(span=params.ema_period, adjust=False).mean()
+    features["atr"] = candidate_true_range(features).rolling(14).mean()
+    features["trend_side"] = np.select(
+        [
+            (close > features["ema"])
+            & (features["fast_return"] > 0)
+            & (features["slow_return"] > 0),
+            (close < features["ema"])
+            & (features["fast_return"] < 0)
+            & (features["slow_return"] < 0),
+        ],
+        [1, -1],
+        default=0,
+    ).astype(int)
+    return features
+
+
+def momentum_snapshot_candidates(
+    features_by_symbol: Dict[str, pd.DataFrame],
+    close_time_ms: int,
+    params: MomentumRotationParameters,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for symbol in params.symbols:
+        frame = features_by_symbol.get(symbol)
+        if frame is None or frame.empty:
+            continue
+        matches = frame[frame["close_time"].astype("int64") == int(close_time_ms)]
+        if matches.empty:
+            continue
+        row = matches.iloc[-1]
+        values = [
+            float(row.get("momentum_score", math.nan)),
+            float(row.get("fast_return", math.nan)),
+            float(row.get("slow_return", math.nan)),
+            float(row.get("realized_volatility", math.nan)),
+            float(row.get("atr", math.nan)),
+        ]
+        if not all(math.isfinite(value) for value in values) or values[3] <= 0 or values[4] <= 0:
+            continue
+        direction_value = int(row.get("trend_side", 0) or 0)
+        score = values[0]
+        if direction_value == 0 or abs(score) < params.minimum_absolute_score:
+            continue
+        if direction_value > 0 and score <= 0:
+            continue
+        if direction_value < 0 and score >= 0:
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "side": "LONG" if direction_value > 0 else "SHORT",
+                "momentum_score": score,
+                "fast_return": values[1],
+                "slow_return": values[2],
+                "realized_volatility": values[3],
+                "atr": values[4],
+                "close": float(row["close"]),
+                "ema": float(row["ema"]),
+            }
+        )
+    if len(rows) < params.minimum_cross_section_size:
+        return []
+    rows.sort(key=lambda item: abs(float(item["momentum_score"])), reverse=True)
+    for rank, row in enumerate(rows, start=1):
+        row["cross_section_rank"] = rank
+        row["universe_size"] = len(rows)
+    return rows
+
+
+def is_daily_momentum_rebalance(close_time_ms: int) -> bool:
+    day_ms = 24 * 60 * 60 * 1000
+    return (int(close_time_ms) + 1) % day_ms == 0
+
+
+def momentum_fixed_order_quantity(
+    entry_price: float,
+    filters: ExchangeFilters,
+    fixed_notional_usdt: float,
+) -> float:
+    if entry_price <= 0 or fixed_notional_usdt <= 0:
+        return 0.0
+    quantity = decimal_floor(fixed_notional_usdt / entry_price, filters.step_size)
+    quantity = min(quantity, filters.max_qty)
+    if quantity < filters.min_qty or quantity * entry_price < filters.min_notional:
+        return 0.0
+    return round(quantity, filters.quantity_precision)
+
+
+def momentum_exit_decision(
+    position: Dict[str, Any],
+    row: Any,
+) -> Optional[Tuple[float, str, bool]]:
+    side = str(position["side"])
+    stop_price = float(position["stop_price"])
+    take_profit_price = float(position["take_profit_price"])
+    open_price = float(row["open"])
+    high_price = float(row["high"])
+    low_price = float(row["low"])
+    if side == "LONG":
+        if open_price <= stop_price:
+            return open_price, "STOP_LOSS", True
+        if open_price >= take_profit_price:
+            return open_price, "TAKE_PROFIT", True
+        if low_price <= stop_price:
+            return stop_price, "STOP_LOSS", False
+        if high_price >= take_profit_price:
+            return take_profit_price, "TAKE_PROFIT", False
+    else:
+        if open_price >= stop_price:
+            return open_price, "STOP_LOSS", True
+        if open_price <= take_profit_price:
+            return open_price, "TAKE_PROFIT", True
+        if high_price >= stop_price:
+            return stop_price, "STOP_LOSS", False
+        if low_price <= take_profit_price:
+            return take_profit_price, "TAKE_PROFIT", False
+    return None
+
+
+def momentum_close_position(
+    position: Dict[str, Any],
+    row: Any,
+    exit_price: float,
+    exit_reason: str,
+    config: Config,
+    funding_rates: Optional[pd.DataFrame],
+    cost_multiplier: float = 1.0,
+    gap_exit: bool = False,
+) -> Dict[str, Any]:
+    symbol_config = replace(config, symbol=str(position["symbol"]))
+    trade = close_candidate_position(
+        position,
+        row,
+        exit_price,
+        exit_reason,
+        symbol_config,
+        funding_rates=funding_rates,
+        cost_multiplier=cost_multiplier,
+        gap_exit=gap_exit,
+    )
+    trade.update(
+        {
+            "entry_momentum_score": position["entry_momentum_score"],
+            "entry_fast_return": position["entry_fast_return"],
+            "entry_slow_return": position["entry_slow_return"],
+            "entry_realized_volatility": position["entry_realized_volatility"],
+            "entry_cross_section_rank": position["entry_cross_section_rank"],
+            "entry_universe_size": position["entry_universe_size"],
+        }
+    )
+    return trade
+
+
+def momentum_rotation_replay(
+    config: Config,
+    filters_by_symbol: Dict[str, ExchangeFilters],
+    features_by_symbol: Dict[str, pd.DataFrame],
+    funding_by_symbol: Dict[str, pd.DataFrame],
+    segment_start_ms: int,
+    segment_end_ms: int,
+    params: MomentumRotationParameters,
+    cost_multiplier: float = 1.0,
+) -> Dict[str, Any]:
+    validate_momentum_rotation_parameters(params)
+    lookups: Dict[str, Dict[int, Any]] = {}
+    timeline_values: Set[int] = set()
+    for symbol, frame in features_by_symbol.items():
+        selected = frame[
+            (frame["close_time"].astype("int64") >= int(segment_start_ms))
+            & (frame["close_time"].astype("int64") < int(segment_end_ms))
+        ]
+        lookups[symbol] = {
+            int(row["close_time"]): row
+            for _, row in selected.iterrows()
+        }
+        timeline_values.update(lookups[symbol])
+    timeline = sorted(timeline_values)
+    trades: List[Dict[str, Any]] = []
+    rejections: Counter = Counter()
+    position: Optional[Dict[str, Any]] = None
+    pending: Optional[Dict[str, Any]] = None
+    accepted_signals = 0
+
+    for timeline_index, close_time_ms in enumerate(timeline):
+        if pending is not None and int(pending["entry_close_time_ms"]) == close_time_ms:
+            symbol = str(pending["symbol"])
+            row = lookups.get(symbol, {}).get(close_time_ms)
+            filters = filters_by_symbol.get(symbol)
+            if row is None or filters is None:
+                rejections["MISSING_ENTRY_CANDLE_OR_FILTERS"] += 1
+            else:
+                entry_price = float(row["open"])
+                quantity = momentum_fixed_order_quantity(
+                    entry_price,
+                    filters,
+                    params.fixed_notional_usdt,
+                )
+                stop_loss_pct = min(
+                    max(
+                        float(pending["atr"]) / entry_price * params.stop_loss_atr_multiple,
+                        params.minimum_stop_loss_pct,
+                    ),
+                    params.maximum_stop_loss_pct,
+                )
+                take_profit_pct = stop_loss_pct * params.reward_to_risk_multiple
+                expected_cost_rate = (
+                    round_trip_execution_cost_rate(config)
+                    + params.anticipated_funding_cost_pct
+                )
+                if quantity <= 0:
+                    rejections["FIXED_NOTIONAL_BELOW_EXCHANGE_MINIMUM"] += 1
+                elif take_profit_pct / expected_cost_rate < params.minimum_reward_to_cost_ratio:
+                    rejections["EXPECTED_REWARD_TO_COST_BELOW_THRESHOLD"] += 1
+                else:
+                    side = str(pending["side"])
+                    stop_price = (
+                        entry_price * (1.0 - stop_loss_pct)
+                        if side == "LONG"
+                        else entry_price * (1.0 + stop_loss_pct)
+                    )
+                    take_profit_price = (
+                        entry_price * (1.0 + take_profit_pct)
+                        if side == "LONG"
+                        else entry_price * (1.0 - take_profit_pct)
+                    )
+                    position = {
+                        "strategy_id": params.strategy_name,
+                        "symbol": symbol,
+                        "side": side,
+                        "signal_time": pending["signal_time"],
+                        "entry_time": candle_time_text(int(row["open_time"])),
+                        "entry_open_time_ms": int(row["open_time"]),
+                        "entry_price": entry_price,
+                        "quantity": quantity,
+                        "stop_price": stop_price,
+                        "take_profit_price": take_profit_price,
+                        "initial_stop_distance_pct": stop_loss_pct,
+                        "initial_take_profit_distance_pct": take_profit_pct,
+                        "entry_ema20": pending["ema"],
+                        "entry_ema50": pending["ema"],
+                        "entry_ema_spread_pct": abs(entry_price - float(pending["ema"])) / entry_price,
+                        "entry_ema_slope_consistency": None,
+                        "entry_trend_persistence": None,
+                        "entry_trend_atr": pending["atr"],
+                        "entry_execution_interval": params.interval,
+                        "entry_atr_execution": pending["atr"],
+                        "entry_atr_execution_pct": float(pending["atr"]) / entry_price,
+                        "entry_atr_execution_percentile": None,
+                        "pullback_distance_atr": None,
+                        "expected_reward_to_cost_ratio": take_profit_pct / expected_cost_rate,
+                        "expected_net_reward_to_risk_ratio": (
+                            (take_profit_pct - expected_cost_rate)
+                            / (stop_loss_pct + expected_cost_rate)
+                        ),
+                        "mfe_pct": 0.0,
+                        "mae_pct": 0.0,
+                        "time_to_mfe_seconds": None,
+                        "time_to_mae_seconds": None,
+                        "holding_bars": 0,
+                        "entry_momentum_score": pending["momentum_score"],
+                        "entry_fast_return": pending["fast_return"],
+                        "entry_slow_return": pending["slow_return"],
+                        "entry_realized_volatility": pending["realized_volatility"],
+                        "entry_cross_section_rank": pending["cross_section_rank"],
+                        "entry_universe_size": pending["universe_size"],
+                    }
+                    accepted_signals += 1
+            pending = None
+
+        if position is not None:
+            symbol = str(position["symbol"])
+            row = lookups.get(symbol, {}).get(close_time_ms)
+            if row is not None:
+                decision = momentum_exit_decision(position, row)
+                if decision is None:
+                    update_candidate_excursions(position, row)
+                    position["holding_bars"] = int(position["holding_bars"]) + 1
+                    if int(position["holding_bars"]) >= params.maximum_holding_bars:
+                        decision = (float(row["close"]), "MAX_HOLDING_TIME", False)
+                if decision is not None:
+                    exit_price, exit_reason, gap_exit = decision
+                    entry_price = float(position["entry_price"])
+                    exit_excursion = abs(exit_price - entry_price) / entry_price
+                    elapsed = max(
+                        (int(row["open_time"]) - int(position["entry_open_time_ms"])) / 1000.0,
+                        0.0,
+                    )
+                    if exit_reason == "TAKE_PROFIT" and exit_excursion > float(position["mfe_pct"]):
+                        position["mfe_pct"] = exit_excursion
+                        position["time_to_mfe_seconds"] = elapsed
+                    if exit_reason == "STOP_LOSS" and exit_excursion > float(position["mae_pct"]):
+                        position["mae_pct"] = exit_excursion
+                        position["time_to_mae_seconds"] = elapsed
+                    trades.append(
+                        momentum_close_position(
+                            position,
+                            row,
+                            exit_price,
+                            exit_reason,
+                            config,
+                            funding_by_symbol.get(symbol),
+                            cost_multiplier=cost_multiplier,
+                            gap_exit=gap_exit,
+                        )
+                    )
+                    position = None
+
+        if not is_daily_momentum_rebalance(close_time_ms):
+            continue
+        candidates = momentum_snapshot_candidates(features_by_symbol, close_time_ms, params)
+        selected = candidates[0] if candidates else None
+        if position is not None:
+            same_position = (
+                selected is not None
+                and str(position["symbol"]) == str(selected["symbol"])
+                and str(position["side"]) == str(selected["side"])
+            )
+            if not same_position:
+                symbol = str(position["symbol"])
+                row = lookups.get(symbol, {}).get(close_time_ms)
+                if row is not None:
+                    trades.append(
+                        momentum_close_position(
+                            position,
+                            row,
+                            float(row["close"]),
+                            "ROTATION" if selected is not None else "SIGNAL_INVALIDATED",
+                            config,
+                            funding_by_symbol.get(symbol),
+                            cost_multiplier=cost_multiplier,
+                        )
+                    )
+                    position = None
+        if position is None and selected is not None and timeline_index + 1 < len(timeline):
+            pending = {
+                **selected,
+                "signal_time": candle_time_text(close_time_ms),
+                "entry_close_time_ms": timeline[timeline_index + 1],
+            }
+        elif selected is None:
+            rejections["NO_ELIGIBLE_CROSS_SECTION"] += 1
+
+    report = summarize_trade_group(trades)
+    report.update(
+        {
+            "strategy_name": params.strategy_name,
+            "evaluated_candles": len(timeline),
+            "accepted_signals": accepted_signals,
+            "rejection_counts": dict(sorted(rejections.items())),
+            "open_position_excluded": position is not None,
+            "pending_signal_excluded": pending is not None,
+        }
+    )
+    return {"report": report, "trades": trades}
+
+
+def deduplicate_momentum_trades(trades: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique: Dict[Tuple[str, str, str, int, int], Dict[str, Any]] = {}
+    for trade in trades:
+        key = (
+            str(trade.get("symbol", "")),
+            str(trade.get("side", "")),
+            str(trade.get("strategy_id", "")),
+            int(trade.get("entry_time_ms", 0) or 0),
+            int(trade.get("exit_time_ms", 0) or 0),
+        )
+        unique.setdefault(key, dict(trade))
+    return sorted(
+        unique.values(),
+        key=lambda trade: (
+            int(trade.get("entry_time_ms", 0) or 0),
+            int(trade.get("exit_time_ms", 0) or 0),
+        ),
+    )
+
+
+def slice_momentum_trades(
+    trades: Sequence[Dict[str, Any]],
+    start_ms: int,
+    end_ms: int,
+) -> List[Dict[str, Any]]:
+    return [
+        dict(trade)
+        for trade in trades
+        if int(start_ms) <= int(trade.get("entry_time_ms", 0) or 0) < int(end_ms)
+    ]
+
+
+def build_momentum_trade_report(trades: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    trade_list = list(trades)
+    report = summarize_trade_group(trade_list)
+    report.update(
+        {
+            "by_symbol": grouped_trade_summary(trade_list, "symbol"),
+            "by_direction": grouped_trade_summary(trade_list, "side"),
+            "exit_reason_counts": dict(
+                Counter(str(trade.get("exit_reason", "UNKNOWN")) for trade in trade_list)
+            ),
+            "holding_seconds_distribution": candidate_distribution(
+                [trade.get("holding_seconds", 0.0) for trade in trade_list]
+            ),
+            "mfe_pct_distribution": candidate_distribution(
+                [trade.get("mfe_pct", 0.0) for trade in trade_list]
+            ),
+            "mae_pct_distribution": candidate_distribution(
+                [trade.get("mae_pct", 0.0) for trade in trade_list]
+            ),
+        }
+    )
+    return report
+
+
+def momentum_segment_gate(
+    report: Dict[str, Any],
+    minimum_trades: int,
+    minimum_profit_factor: float,
+) -> Dict[str, Any]:
+    failures: List[str] = []
+    if int(report.get("trades", 0) or 0) < minimum_trades:
+        failures.append("INSUFFICIENT_TRADES")
+    if report.get("expectancy") is None or float(report["expectancy"]) <= 0:
+        failures.append("NON_POSITIVE_EXPECTANCY")
+    if (
+        report.get("net_profit_factor") is None
+        or float(report["net_profit_factor"]) <= minimum_profit_factor
+    ):
+        failures.append("NET_PROFIT_FACTOR_BELOW_THRESHOLD")
+    return {
+        "eligible": not failures,
+        "minimum_trades": minimum_trades,
+        "minimum_net_profit_factor": minimum_profit_factor,
+        "failure_reasons": failures,
+    }
+
+
+def momentum_capital_overlay(
+    trades: Sequence[Dict[str, Any]],
+    filters_by_symbol: Dict[str, ExchangeFilters],
+    config: Config,
+    params: MomentumRotationParameters,
+    starting_capital_usdt: float,
+) -> Dict[str, Any]:
+    starting_capital = float(starting_capital_usdt)
+    if starting_capital <= 0:
+        raise ConfigError("V10 capital overlay requires positive starting capital")
+    risk_config = replace(
+        config,
+        max_net_loss_per_trade_usdt=starting_capital * params.max_risk_pct,
+        max_risk_per_trade_pct=params.max_risk_pct,
+        max_margin_usdt=starting_capital * params.max_account_margin_fraction,
+        max_account_margin_fraction=params.max_account_margin_fraction,
+        max_notional_usdt=starting_capital * config.leverage,
+        gap_risk_buffer_pct=config.gap_risk_buffer_pct + params.anticipated_funding_cost_pct,
+    )
+    equity = starting_capital
+    accepted: List[Dict[str, Any]] = []
+    skip_reasons: Counter = Counter()
+    source_trades = sorted(
+        [dict(trade) for trade in trades],
+        key=lambda trade: int(trade.get("entry_time_ms", 0) or 0),
+    )
+    monetary_fields = (
+        "gross_pnl",
+        "fees",
+        "slippage",
+        "spread_cost",
+        "funding_pnl",
+        "execution_cost",
+        "net_pnl",
+        "mfe_usdt",
+        "mae_usdt",
+    )
+    for source in source_trades:
+        symbol = str(source.get("symbol", ""))
+        filters = filters_by_symbol.get(symbol)
+        entry_price = float(source.get("entry_price", 0.0) or 0.0)
+        stop_loss_pct = float(source.get("initial_stop_distance_pct", 0.0) or 0.0)
+        if filters is None:
+            skip_reasons["MISSING_EXCHANGE_FILTERS"] += 1
+            continue
+        plan = build_risk_sizing_plan(
+            equity,
+            entry_price,
+            filters,
+            risk_config,
+            stop_loss_pct=stop_loss_pct,
+        )
+        if plan.skip_reason:
+            skip_reasons[candidate_risk_skip_reason(plan.skip_reason)] += 1
+            continue
+        fixed_quantity = float(source.get("quantity", 0.0) or 0.0)
+        if fixed_quantity <= 0 or plan.quantity <= 0:
+            skip_reasons["INVALID_SOURCE_OR_SIZED_QUANTITY"] += 1
+            continue
+        scale = plan.quantity / fixed_quantity
+        trade = dict(source)
+        for field_name in monetary_fields:
+            trade[field_name] = float(source.get(field_name, 0.0) or 0.0) * scale
+        trade["quantity"] = plan.quantity
+        trade["entry_notional"] = plan.quantity * entry_price
+        trade["exit_notional"] = plan.quantity * float(source.get("exit_price", 0.0) or 0.0)
+        trade["sizing_mode"] = "risk_sized"
+        trade["risk_budget_usdt"] = plan.risk_budget_usdt
+        trade["estimated_net_loss_usdt"] = plan.estimated_net_loss_usdt
+        trade["result"] = "WIN" if float(trade["net_pnl"]) > 0 else "LOSS"
+        accepted.append(trade)
+        equity += float(trade["net_pnl"])
+        if equity <= 0:
+            skip_reasons["CAPITAL_DEPLETED"] += len(source_trades) - len(accepted)
+            break
+    report = build_momentum_trade_report(accepted)
+    report.update(
+        {
+            "starting_capital_usdt": starting_capital,
+            "ending_capital_usdt": equity,
+            "source_trade_count": len(source_trades),
+            "execution_coverage": len(accepted) / len(source_trades) if source_trades else 0.0,
+            "skip_reasons": dict(sorted(skip_reasons.items())),
+            "maximum_absolute_loss_cap_usdt": starting_capital * params.max_risk_pct,
+            "maximum_margin_cap_usdt": starting_capital * params.max_account_margin_fraction,
+            "maximum_notional_cap_usdt": starting_capital * config.leverage,
+        }
+    )
+    return {"report": report, "trades": accepted}
+
+
+def run_momentum_rotation_replay(
+    config: Config,
+    days: int,
+    end_time: Optional[str],
+    cache_dir_value: str,
+    output_dir_value: str,
+    params: Optional[MomentumRotationParameters] = None,
+    client: Any = None,
+) -> Dict[str, Any]:
+    if config.live_trading or not config.dry_run or not config.shadow_mode:
+        raise ConfigError("V10 replay requires LIVE_TRADING=false, DRY_RUN=true, and SHADOW_MODE=true")
+    params = params or MomentumRotationParameters()
+    validate_momentum_rotation_parameters(params)
+    end_exclusive_ms = aligned_replay_end_ms(params.interval, end_time)
+    windows = rolling_walk_forward_boundaries(days, end_exclusive_ms, params)
+    interval_value_seconds = interval_seconds(params.interval)
+    if interval_value_seconds is None:
+        raise ConfigError("V10 replay interval is invalid")
+    warmup_bars = max(
+        params.slow_momentum_bars,
+        params.volatility_lookback_bars,
+        params.ema_period,
+    ) + 2
+    master_start_ms = int(windows[0]["train"][0])
+    download_start_ms = master_start_ms - warmup_bars * interval_value_seconds * 1000
+    cache_dir = resolve_app_path(cache_dir_value)
+    output_dir = resolve_app_path(output_dir_value)
+    public_client = client or build_public_replay_client(config)
+    filters_by_symbol: Dict[str, ExchangeFilters] = {}
+    features_by_symbol: Dict[str, pd.DataFrame] = {}
+    funding_by_symbol: Dict[str, pd.DataFrame] = {}
+    cache_files: Dict[str, Dict[str, Any]] = {}
+
+    for symbol in params.symbols:
+        symbol_config = replace(config, symbol=symbol, interval=params.interval)
+        kline_cache = cache_dir / f"{symbol}_{params.interval}.csv"
+        funding_cache = cache_dir / f"{symbol}_funding.csv"
+        filters_by_symbol[symbol] = get_exchange_filters(public_client, symbol, symbol_config)
+        klines = ensure_historical_kline_cache(
+            public_client,
+            symbol_config,
+            download_start_ms,
+            end_exclusive_ms - 1,
+            kline_cache,
+        )
+        funding = ensure_funding_rate_cache(
+            public_client,
+            symbol_config,
+            master_start_ms,
+            end_exclusive_ms - 1,
+            funding_cache,
+        )
+        features_by_symbol[symbol] = build_momentum_feature_frame(klines, params)
+        funding_by_symbol[symbol] = funding
+        cache_files[symbol] = {
+            "klines": str(kline_cache),
+            "klines_sha256": file_sha256(kline_cache),
+            "funding": str(funding_cache),
+            "funding_sha256": file_sha256(funding_cache),
+            "candles": len(klines),
+            "funding_rows": len(funding),
+        }
+
+    master = momentum_rotation_replay(
+        config,
+        filters_by_symbol,
+        features_by_symbol,
+        funding_by_symbol,
+        master_start_ms,
+        end_exclusive_ms,
+        params,
+    )
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = output_dir / "runs" / run_id
+    write_candidate_trades(run_dir / "master_fixed.csv", master["trades"])
+
+    aggregate: Dict[str, List[Dict[str, Any]]] = {
+        "train": [],
+        "validation": [],
+        "test": [],
+    }
+    window_reports: List[Dict[str, Any]] = []
+    positive_test_windows = 0
+    for window in windows:
+        segment_reports: Dict[str, Any] = {}
+        for segment_name in ("train", "validation", "test"):
+            start_ms, end_ms = window[segment_name]
+            segment_trades = slice_momentum_trades(master["trades"], start_ms, end_ms)
+            aggregate[segment_name].extend(segment_trades)
+            segment_report = build_momentum_trade_report(segment_trades)
+            segment_report.update(
+                {
+                    "start": candle_time_text(start_ms),
+                    "end_exclusive": candle_time_text(end_ms),
+                }
+            )
+            segment_reports[segment_name] = segment_report
+            if (
+                segment_name == "test"
+                and segment_report.get("expectancy") is not None
+                and float(segment_report["expectancy"]) > 0
+            ):
+                positive_test_windows += 1
+        window_reports.append(
+            {
+                "window_id": window["window_id"],
+                "embargo_minutes": window["embargo_minutes"],
+                **segment_reports,
+            }
+        )
+
+    aggregate = {
+        segment_name: deduplicate_momentum_trades(segment_trades)
+        for segment_name, segment_trades in aggregate.items()
+    }
+    train_report = build_momentum_trade_report(aggregate["train"])
+    validation_report = build_momentum_trade_report(aggregate["validation"])
+    test_report = build_momentum_trade_report(aggregate["test"])
+    train_gate = momentum_segment_gate(
+        train_report,
+        params.minimum_train_trades,
+        params.minimum_train_profit_factor,
+    )
+    validation_gate = momentum_segment_gate(
+        validation_report,
+        params.minimum_validation_trades,
+        params.minimum_validation_profit_factor,
+    )
+    test_gate = momentum_segment_gate(
+        test_report,
+        params.minimum_test_trades,
+        params.minimum_test_profit_factor,
+    )
+    cost_stress = build_cost_stress_report(aggregate["test"], params.cost_stress_multipliers)
+    bootstrap = block_bootstrap_expectancy(
+        aggregate["test"],
+        params.bootstrap_samples,
+        params.bootstrap_block_trades,
+    )
+    capital_results: Dict[str, Dict[str, Any]] = {}
+    for capital in params.capital_scenarios_usdt:
+        result = momentum_capital_overlay(
+            aggregate["test"],
+            filters_by_symbol,
+            config,
+            params,
+            capital,
+        )
+        key = capital_scenario_key(capital)
+        capital_results[key] = result["report"]
+        write_candidate_trades(run_dir / f"test_{key}_risk_sized.csv", result["trades"])
+
+    positive_window_fraction = (
+        positive_test_windows / len(windows) if windows else 0.0
+    )
+    qualification_key = capital_scenario_key(params.qualification_capital_usdt)
+    qualification_capital = capital_results[qualification_key]
+    failures: List[str] = []
+    if len(windows) < params.minimum_walk_forward_windows:
+        failures.append("INSUFFICIENT_WALK_FORWARD_WINDOWS")
+    if not train_gate["eligible"]:
+        failures.append("TRAIN_GATE_FAILED")
+    if not validation_gate["eligible"]:
+        failures.append("VALIDATION_GATE_FAILED")
+    if not test_gate["eligible"]:
+        failures.append("TEST_GATE_FAILED")
+    if positive_window_fraction < params.minimum_positive_test_window_fraction:
+        failures.append("POSITIVE_TEST_WINDOW_FRACTION_BELOW_THRESHOLD")
+    stressed_15x = cost_stress.get("1.5x", {})
+    if (
+        stressed_15x.get("expectancy") is None
+        or float(stressed_15x["expectancy"]) <= 0
+        or stressed_15x.get("net_profit_factor") is None
+        or float(stressed_15x["net_profit_factor"]) <= params.minimum_test_profit_factor
+    ):
+        failures.append("FAILED_1_5X_COST_STRESS")
+    if bootstrap.get("lower_95") is None or float(bootstrap["lower_95"]) <= 0:
+        failures.append("BOOTSTRAP_EXPECTANCY_LOWER_BOUND_NOT_POSITIVE")
+    if (
+        float(qualification_capital.get("execution_coverage", 0.0) or 0.0)
+        < params.minimum_capital_execution_coverage
+    ):
+        failures.append("QUALIFICATION_CAPITAL_COVERAGE_BELOW_THRESHOLD")
+    if float(qualification_capital.get("net_pnl", 0.0) or 0.0) <= 0:
+        failures.append("QUALIFICATION_CAPITAL_NET_PNL_NOT_POSITIVE")
+    if (
+        float(qualification_capital.get("max_drawdown", 0.0) or 0.0)
+        >= params.maximum_qualification_drawdown_usdt
+    ):
+        failures.append("QUALIFICATION_CAPITAL_DRAWDOWN_EXCEEDED")
+    historical_gate_passed = not failures
+    viability_status = (
+        "CANDIDATE_FOR_FORWARD_SHADOW" if historical_gate_passed else "NOT_VIABLE"
+    )
+
+    summary = {
+        "engine": params.profile_name,
+        "strategy_name": params.strategy_name,
+        "generated_at": utc_now_text(),
+        "run_id": run_id,
+        "days": days,
+        "symbols": list(params.symbols),
+        "parameters": asdict(params),
+        "cache_files": cache_files,
+        "walk_forward": {
+            "window_count": len(windows),
+            "positive_test_windows": positive_test_windows,
+            "positive_test_window_fraction": positive_window_fraction,
+            "windows": window_reports,
+        },
+        "master": master["report"],
+        "train": {**train_report, "gate": train_gate},
+        "validation": {**validation_report, "gate": validation_gate},
+        "test": {**test_report, "gate": test_gate},
+        "test_cost_stress": cost_stress,
+        "test_block_bootstrap_expectancy": bootstrap,
+        "capital_results": capital_results,
+        "qualification_capital_key": qualification_key,
+        "failure_reasons": failures,
+        "historical_gate_passed": historical_gate_passed,
+        "viability_status": viability_status,
+        "eligible_for_forward_shadow_validation": historical_gate_passed,
+        "eligible_for_micro_live_test": False,
+        "fresh_forward_validation_required": True,
+        "recommendation": (
+            "BEGIN_FORWARD_SHADOW_VALIDATION" if historical_gate_passed else "DO_NOT_TRADE_LIVE"
+        ),
+        "shadow_mode_only": True,
+        "dry_run": True,
+        "live_trading": False,
+        "api_credentials_used": False,
+        "account_state_changed": False,
+        "source_sha256": file_sha256(Path(__file__).resolve()),
+    }
+    write_candidate_trades(run_dir / "train_fixed.csv", aggregate["train"])
+    write_candidate_trades(run_dir / "validation_fixed.csv", aggregate["validation"])
+    write_candidate_trades(run_dir / "test_fixed.csv", aggregate["test"])
+    write_json_atomic(run_dir / "summary.json", summary)
+    write_json_atomic(output_dir / "latest.json", summary)
+    return summary
+
+
 def run_historical_replay(
     config: Config,
     days: int,
@@ -6865,6 +7743,28 @@ def candidate_portfolio_replay_main(arguments: Sequence[str]) -> None:
     print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
 
 
+def parse_momentum_rotation_args(arguments: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run frozen V10 cross-sectional momentum validation")
+    parser.add_argument("--days", type=int, default=720)
+    parser.add_argument("--end-time", default=None)
+    parser.add_argument("--cache-dir", default="historical_data/v10_momentum")
+    parser.add_argument("--output-dir", default="momentum_replay_v10")
+    return parser.parse_args(list(arguments))
+
+
+def momentum_rotation_main(arguments: Sequence[str]) -> None:
+    args = parse_momentum_rotation_args(arguments)
+    config = load_config()
+    summary = run_momentum_rotation_replay(
+        config,
+        days=args.days,
+        end_time=args.end_time,
+        cache_dir_value=args.cache_dir,
+        output_dir_value=args.output_dir,
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
+
+
 def parse_feasibility_stop_scenarios(value: str) -> Tuple[float, ...]:
     try:
         values = tuple(float(item.strip()) for item in str(value).split(",") if item.strip())
@@ -8359,6 +9259,9 @@ def main() -> None:
             return
         if len(sys.argv) > 1 and sys.argv[1] == "candidate-portfolio-replay":
             candidate_portfolio_replay_main(sys.argv[2:])
+            return
+        if len(sys.argv) > 1 and sys.argv[1] == "v10-replay":
+            momentum_rotation_main(sys.argv[2:])
             return
         if len(sys.argv) > 1 and sys.argv[1] == "feasibility-scan":
             feasibility_scan_main(sys.argv[2:])

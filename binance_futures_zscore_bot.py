@@ -54,6 +54,7 @@ CANDIDATE_PROFILE_V5 = "v5_30m_2h"
 CANDIDATE_PROFILE_V6 = "v6_long_cost_gate_30m_2h"
 CANDIDATE_PROFILE_V7 = "v7_cost_aware_breakout_15m_1h_4h"
 CANDIDATE_PROFILE_V8 = "v8_cost_aware_pullback_15m_1h_4h"
+CANDIDATE_PROFILE_V9 = "v9_cross_asset_pullback_15m_1h_4h"
 CANDIDATE_REPLAY_PROFILES = (
     CANDIDATE_PROFILE_V3,
     CANDIDATE_PROFILE_V4,
@@ -61,6 +62,7 @@ CANDIDATE_REPLAY_PROFILES = (
     CANDIDATE_PROFILE_V6,
     CANDIDATE_PROFILE_V7,
     CANDIDATE_PROFILE_V8,
+    CANDIDATE_PROFILE_V9,
 )
 CANDIDATE_DIRECTIONS = ("LONG", "SHORT")
 CANDIDATE_TREND_LONG_NAME = "TREND_PULLBACK_LONG"
@@ -69,6 +71,8 @@ CANDIDATE_BREAKOUT_LONG_NAME = "COST_AWARE_TREND_BREAKOUT_V7_LONG"
 CANDIDATE_BREAKOUT_SHORT_NAME = "COST_AWARE_TREND_BREAKOUT_V7_SHORT"
 CANDIDATE_REGIME_PULLBACK_LONG_NAME = "COST_AWARE_TREND_PULLBACK_V8_LONG"
 CANDIDATE_REGIME_PULLBACK_SHORT_NAME = "COST_AWARE_TREND_PULLBACK_V8_SHORT"
+CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME = "CROSS_ASSET_TREND_PULLBACK_V9_LONG"
+CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME = "CROSS_ASSET_TREND_PULLBACK_V9_SHORT"
 CANDIDATE_MEAN_REVERSION_NAME = "MEAN_REVERSION_INDEPENDENT"
 CANDIDATE_LEDGER_NAMES = (
     CANDIDATE_TREND_LONG_NAME,
@@ -83,13 +87,19 @@ SUPPORTED_CANDIDATE_LEDGER_NAMES += (
     CANDIDATE_BREAKOUT_SHORT_NAME,
     CANDIDATE_REGIME_PULLBACK_LONG_NAME,
     CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+    CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME,
+    CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME,
+)
+CANDIDATE_REGIME_PULLBACK_LEDGER_NAMES = (
+    CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+    CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+    CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME,
+    CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME,
 )
 CANDIDATE_HIGHER_TIMEFRAME_LEDGER_NAMES = (
     CANDIDATE_BREAKOUT_LONG_NAME,
     CANDIDATE_BREAKOUT_SHORT_NAME,
-    CANDIDATE_REGIME_PULLBACK_LONG_NAME,
-    CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
-)
+) + CANDIDATE_REGIME_PULLBACK_LEDGER_NAMES
 ELITE_STRATEGY_NAME = "ELITE_LONG_STRATEGY"
 SHADOW_PROBE_STRATEGY_NAME = "SHADOW_PROBE_STRATEGY"
 ROUTER_NAME = "REGIME_STRATEGY_ROUTER"
@@ -438,6 +448,8 @@ class CandidateReplayParameters:
     cost_gate_min_net_profit_factor: float = 1.15
     minimum_risk_sized_coverage: float = 0.0
     minimum_cross_symbol_qualified_fraction: float = 0.75
+    portfolio_symbols: Tuple[str, ...] = ("SOLUSDT", "BTCUSDT", "ETHUSDT", "BNBUSDT")
+    portfolio_symbol_qualification_mode: str = "all_strategies"
 
 
 def candidate_replay_parameters_for_profile(profile_name: str) -> CandidateReplayParameters:
@@ -596,6 +608,21 @@ def candidate_replay_parameters_for_profile(profile_name: str) -> CandidateRepla
             enforce_fixed_notional_drawdown=False,
             maximum_risk_sized_drawdown_usdt=0.20,
             minimum_risk_sized_coverage=0.50,
+        )
+    if normalized == CANDIDATE_PROFILE_V9:
+        v8 = candidate_replay_parameters_for_profile(CANDIDATE_PROFILE_V8)
+        return replace(
+            v8,
+            strategy_name="CROSS_ASSET_TREND_PULLBACK_V9",
+            profile_name=CANDIDATE_PROFILE_V9,
+            engine_name="cross_asset_pullback_15m_1h_4h_rolling_walk_forward_v9",
+            strategy_ids=(
+                CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME,
+                CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME,
+            ),
+            portfolio_symbols=("BTCUSDT", "ETHUSDT"),
+            minimum_cross_symbol_qualified_fraction=1.0,
+            portfolio_symbol_qualification_mode="any_strategy",
         )
     raise ConfigError(f"Unsupported candidate replay profile: {profile_name}")
 
@@ -4416,12 +4443,14 @@ def candidate_strategy_direction(strategy_id: str) -> str:
         CANDIDATE_TREND_LONG_NAME,
         CANDIDATE_BREAKOUT_LONG_NAME,
         CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+        CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME,
     ):
         return "LONG"
     if strategy_id in (
         CANDIDATE_TREND_SHORT_NAME,
         CANDIDATE_BREAKOUT_SHORT_NAME,
         CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+        CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME,
     ):
         return "SHORT"
     raise ConfigError(f"Candidate strategy has no fixed direction: {strategy_id}")
@@ -5035,10 +5064,7 @@ def candidate_replay_strategy(
             direction = candidate_strategy_direction(strategy_id)
             accepted, reason = evaluate_breakout_candidate_signal(row, direction, params)
             pullback_distance = 0.0
-        elif strategy_id in (
-            CANDIDATE_REGIME_PULLBACK_LONG_NAME,
-            CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
-        ):
+        elif strategy_id in CANDIDATE_REGIME_PULLBACK_LEDGER_NAMES:
             direction = candidate_strategy_direction(strategy_id)
             accepted, reason, pullback_distance = evaluate_regime_pullback_candidate_signal(
                 row,
@@ -6250,10 +6276,14 @@ def run_candidate_portfolio_replay(
     if config.live_trading or not config.dry_run or not config.shadow_mode:
         raise ConfigError("Portfolio replay requires LIVE_TRADING=false, DRY_RUN=true, and SHADOW_MODE=true")
     normalized_symbols = normalize_candidate_symbols(symbols)
+    qualification_mode = params.portfolio_symbol_qualification_mode
+    if qualification_mode not in {"all_strategies", "any_strategy"}:
+        raise ConfigError(f"Unsupported portfolio symbol qualification mode: {qualification_mode}")
     output_dir = resolve_app_path(output_dir_value)
     symbol_summaries: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
     qualified_symbols: List[str] = []
+    qualified_strategy_pairs: List[Dict[str, str]] = []
     for symbol in normalized_symbols:
         symbol_config = replace(config, symbol=symbol)
         symbol_output = output_dir / symbol
@@ -6272,14 +6302,18 @@ def run_candidate_portfolio_replay(
             errors[symbol] = f"{type(exc).__name__}: {exc}"
             continue
         strategy_summaries: Dict[str, Any] = {}
-        symbol_qualified = True
+        strategy_qualifications: List[bool] = []
+        qualified_strategy_ids: List[str] = []
         for strategy_id in params.strategy_ids:
             validation = result["out_of_sample_validation"][strategy_id]
             fixed = validation["fixed_notional"]
             risk = validation["risk_sized"]
             raw_test = validation["raw_baseline"]["test"]
             strategy_qualified = bool(validation["eligible_for_forward_shadow_validation"])
-            symbol_qualified = symbol_qualified and strategy_qualified
+            strategy_qualifications.append(strategy_qualified)
+            if strategy_qualified:
+                qualified_strategy_ids.append(strategy_id)
+                qualified_strategy_pairs.append({"symbol": symbol, "strategy_id": strategy_id})
             strategy_summaries[strategy_id] = {
                 "historical_gate_passed": bool(validation["historical_gate_passed"]),
                 "eligible_for_forward_shadow_validation": strategy_qualified,
@@ -6299,12 +6333,18 @@ def run_candidate_portfolio_replay(
                 "risk_sized_execution_coverage": float(risk.get("execution_coverage", 0.0) or 0.0),
                 "risk_sized_net_pnl": risk.get("net_pnl"),
             }
+        symbol_qualified = (
+            all(strategy_qualifications)
+            if qualification_mode == "all_strategies"
+            else any(strategy_qualifications)
+        )
         if symbol_qualified:
             qualified_symbols.append(symbol)
         symbol_summaries[symbol] = {
             "report_file": str(symbol_output / "latest.json"),
             "viability_status": result["viability_status"],
             "qualified": symbol_qualified,
+            "qualified_strategy_ids": qualified_strategy_ids,
             "strategies": strategy_summaries,
         }
     minimum_qualified_symbols = max(
@@ -6331,6 +6371,8 @@ def run_candidate_portfolio_replay(
         "symbol_summaries": symbol_summaries,
         "errors": errors,
         "qualified_symbols": qualified_symbols,
+        "qualified_strategy_pairs": qualified_strategy_pairs,
+        "symbol_qualification_mode": qualification_mode,
         "minimum_qualified_symbols": minimum_qualified_symbols,
         "cross_symbol_qualified_fraction": (
             len(qualified_symbols) / len(normalized_symbols) if normalized_symbols else 0.0
@@ -6383,8 +6425,8 @@ def candidate_replay_main(arguments: Sequence[str]) -> None:
 
 def parse_candidate_portfolio_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run cross-symbol candidate robustness validation")
-    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V8)
-    parser.add_argument("--symbols", default="SOLUSDT,BTCUSDT,ETHUSDT,BNBUSDT")
+    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V9)
+    parser.add_argument("--symbols", default=None)
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--end-time", default=None)
     parser.add_argument("--output-dir", default="candidate_portfolio_replay")
@@ -6395,7 +6437,8 @@ def candidate_portfolio_replay_main(arguments: Sequence[str]) -> None:
     args = parse_candidate_portfolio_replay_args(arguments)
     config = load_config()
     params = candidate_replay_parameters_for_profile(args.profile)
-    symbols = tuple(item for item in str(args.symbols).split(",") if item.strip())
+    symbols_value = args.symbols or ",".join(params.portfolio_symbols)
+    symbols = tuple(item for item in str(symbols_value).split(",") if item.strip())
     summary = run_candidate_portfolio_replay(
         config,
         symbols=symbols,

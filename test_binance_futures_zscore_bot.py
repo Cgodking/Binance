@@ -1516,6 +1516,40 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertEqual(v8.target_reward_to_risk_multiple, 2.5)
         self.assertEqual(v8.minimum_test_net_profit_factor, 1.10)
         self.assertEqual(v8.embargo_minutes, v8.max_holding_minutes)
+        v9 = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V9
+        )
+        self.assertEqual(v9.portfolio_symbols, ("BTCUSDT", "ETHUSDT"))
+        self.assertEqual(v9.portfolio_symbol_qualification_mode, "any_strategy")
+        self.assertEqual(v9.minimum_cross_symbol_qualified_fraction, 1.0)
+        self.assertEqual(
+            v9.strategy_ids,
+            (
+                self.module.CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME,
+                self.module.CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME,
+            ),
+        )
+        frozen_signal_fields = (
+            "source_interval",
+            "execution_interval",
+            "trend_interval",
+            "regime_interval",
+            "trend_fast_ema_period",
+            "trend_slow_ema_period",
+            "trend_persistence_bars",
+            "min_slope_consistency",
+            "min_ema_spread_pct",
+            "max_atr_percentile",
+            "max_pullback_distance_atr",
+            "stop_loss_atr_multiple",
+            "target_reward_to_risk_multiple",
+            "minimum_stop_loss_pct",
+            "maximum_stop_loss_pct",
+            "minimum_take_profit_pct",
+            "maximum_take_profit_pct",
+        )
+        for field_name in frozen_signal_fields:
+            self.assertEqual(getattr(v9, field_name), getattr(v8, field_name))
         with self.assertRaises(self.module.ConfigError):
             self.module.candidate_replay_parameters_for_profile("unknown")
 
@@ -1529,6 +1563,9 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertIsNone(defaults.days)
         self.assertEqual(selected.profile, self.module.CANDIDATE_PROFILE_V5)
         self.assertEqual(selected.days, 930)
+        portfolio_defaults = self.module.parse_candidate_portfolio_replay_args([])
+        self.assertEqual(portfolio_defaults.profile, self.module.CANDIDATE_PROFILE_V9)
+        self.assertIsNone(portfolio_defaults.symbols)
 
     def test_v7_donchian_and_volume_baselines_exclude_current_candle(self):
         params = self.module.replace(
@@ -2220,6 +2257,86 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertFalse(summary["eligible_for_forward_shadow_validation"])
         self.assertFalse(summary["eligible_for_micro_live_test"])
         self.assertEqual(summary["recommendation"], "DO_NOT_TRADE_LIVE")
+
+    def test_v9_portfolio_allows_independent_direction_per_symbol(self):
+        params = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V9
+        )
+
+        def validation(qualified):
+            return {
+                "historical_gate_passed": qualified,
+                "eligible_for_forward_shadow_validation": qualified,
+                "failure_reasons": [] if qualified else ["TEST_FAILURE"],
+                "fixed_notional": {
+                    "trades": 100,
+                    "net_pnl": 1.0 if qualified else -1.0,
+                    "expectancy": 0.01 if qualified else -0.01,
+                    "net_profit_factor": 1.2 if qualified else 0.8,
+                },
+                "risk_sized": {
+                    "trades": 60 if qualified else 0,
+                    "execution_coverage": 0.60 if qualified else 0.0,
+                    "net_pnl": 0.5 if qualified else 0.0,
+                },
+                "raw_baseline": {
+                    "test": {
+                        "trades": 100,
+                        "net_pnl": 1.0 if qualified else -1.0,
+                        "expectancy": 0.01 if qualified else -0.01,
+                        "net_profit_factor": 1.2 if qualified else 0.8,
+                    }
+                },
+                "walk_forward_consistency": {"positive_window_fraction": 0.75},
+            }
+
+        def fake_replay(symbol_config, **_kwargs):
+            long_qualified = symbol_config.symbol == "BTCUSDT"
+            short_qualified = symbol_config.symbol == "ETHUSDT"
+            return {
+                "viability_status": "TEST",
+                "out_of_sample_validation": {
+                    self.module.CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME: validation(
+                        long_qualified
+                    ),
+                    self.module.CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME: validation(
+                        short_qualified
+                    ),
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            self.module,
+            "run_candidate_replay",
+            side_effect=fake_replay,
+        ):
+            summary = self.module.run_candidate_portfolio_replay(
+                self.config,
+                params.portfolio_symbols,
+                days=params.default_replay_days,
+                end_time=None,
+                output_dir_value=temp_dir,
+                params=params,
+            )
+
+        self.assertEqual(summary["minimum_qualified_symbols"], 2)
+        self.assertEqual(summary["qualified_symbols"], ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(summary["symbol_qualification_mode"], "any_strategy")
+        self.assertEqual(
+            summary["qualified_strategy_pairs"],
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy_id": self.module.CANDIDATE_CROSS_ASSET_PULLBACK_LONG_NAME,
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "strategy_id": self.module.CANDIDATE_CROSS_ASSET_PULLBACK_SHORT_NAME,
+                },
+            ],
+        )
+        self.assertTrue(summary["eligible_for_forward_shadow_validation"])
+        self.assertFalse(summary["eligible_for_micro_live_test"])
 
     def test_candidate_features_never_attach_an_unclosed_future_trend_candle(self):
         rows = []

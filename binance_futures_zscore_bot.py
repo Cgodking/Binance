@@ -53,18 +53,22 @@ CANDIDATE_PROFILE_V4 = "v4_15m_1h"
 CANDIDATE_PROFILE_V5 = "v5_30m_2h"
 CANDIDATE_PROFILE_V6 = "v6_long_cost_gate_30m_2h"
 CANDIDATE_PROFILE_V7 = "v7_cost_aware_breakout_15m_1h_4h"
+CANDIDATE_PROFILE_V8 = "v8_cost_aware_pullback_15m_1h_4h"
 CANDIDATE_REPLAY_PROFILES = (
     CANDIDATE_PROFILE_V3,
     CANDIDATE_PROFILE_V4,
     CANDIDATE_PROFILE_V5,
     CANDIDATE_PROFILE_V6,
     CANDIDATE_PROFILE_V7,
+    CANDIDATE_PROFILE_V8,
 )
 CANDIDATE_DIRECTIONS = ("LONG", "SHORT")
 CANDIDATE_TREND_LONG_NAME = "TREND_PULLBACK_LONG"
 CANDIDATE_TREND_SHORT_NAME = "TREND_PULLBACK_SHORT"
 CANDIDATE_BREAKOUT_LONG_NAME = "COST_AWARE_TREND_BREAKOUT_V7_LONG"
 CANDIDATE_BREAKOUT_SHORT_NAME = "COST_AWARE_TREND_BREAKOUT_V7_SHORT"
+CANDIDATE_REGIME_PULLBACK_LONG_NAME = "COST_AWARE_TREND_PULLBACK_V8_LONG"
+CANDIDATE_REGIME_PULLBACK_SHORT_NAME = "COST_AWARE_TREND_PULLBACK_V8_SHORT"
 CANDIDATE_MEAN_REVERSION_NAME = "MEAN_REVERSION_INDEPENDENT"
 CANDIDATE_LEDGER_NAMES = (
     CANDIDATE_TREND_LONG_NAME,
@@ -77,6 +81,14 @@ SUPPORTED_CANDIDATE_LEDGER_NAMES = CANDIDATE_LEDGER_NAMES + LEGACY_CANDIDATE_LED
 SUPPORTED_CANDIDATE_LEDGER_NAMES += (
     CANDIDATE_BREAKOUT_LONG_NAME,
     CANDIDATE_BREAKOUT_SHORT_NAME,
+    CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+    CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+)
+CANDIDATE_HIGHER_TIMEFRAME_LEDGER_NAMES = (
+    CANDIDATE_BREAKOUT_LONG_NAME,
+    CANDIDATE_BREAKOUT_SHORT_NAME,
+    CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+    CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
 )
 ELITE_STRATEGY_NAME = "ELITE_LONG_STRATEGY"
 SHADOW_PROBE_STRATEGY_NAME = "SHADOW_PROBE_STRATEGY"
@@ -526,6 +538,59 @@ def candidate_replay_parameters_for_profile(profile_name: str) -> CandidateRepla
             minimum_test_net_profit_factor=1.15,
             minimum_reward_to_cost_ratio=5.0,
             minimum_net_reward_to_risk_ratio=2.0,
+            anticipated_funding_cost_pct=0.0003,
+            train_cost_gate_enabled=False,
+            enforce_fixed_notional_drawdown=False,
+            maximum_risk_sized_drawdown_usdt=0.20,
+            minimum_risk_sized_coverage=0.50,
+        )
+    if normalized == CANDIDATE_PROFILE_V8:
+        return replace(
+            base,
+            strategy_name="COST_AWARE_TREND_PULLBACK_V8",
+            profile_name=CANDIDATE_PROFILE_V8,
+            engine_name="cost_aware_pullback_15m_1h_4h_rolling_walk_forward_v8",
+            default_replay_days=720,
+            source_interval="15m",
+            execution_interval="15m",
+            trend_interval="1h",
+            regime_interval="4h",
+            strategy_ids=(
+                CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+                CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+            ),
+            trend_fast_ema_period=20,
+            trend_slow_ema_period=50,
+            trend_persistence_bars=6,
+            slope_consistency_window=6,
+            min_slope_consistency=2.0 / 3.0,
+            min_ema_spread_pct=0.0015,
+            max_atr_percentile=0.80,
+            max_pullback_distance_atr=0.75,
+            stop_loss_atr_multiple=1.25,
+            take_profit_atr_multiple=3.125,
+            target_reward_to_risk_multiple=2.5,
+            minimum_stop_loss_pct=0.0060,
+            maximum_stop_loss_pct=0.0250,
+            minimum_take_profit_pct=0.0150,
+            maximum_take_profit_pct=0.0625,
+            max_holding_minutes=48 * 60,
+            cooldown_minutes=240,
+            fixed_notional_usdt=100.0,
+            walk_forward_train_days=180,
+            walk_forward_validation_days=90,
+            walk_forward_test_days=90,
+            walk_forward_step_days=90,
+            embargo_minutes=48 * 60,
+            minimum_walk_forward_windows=5,
+            minimum_train_trades=50,
+            minimum_validation_trades=30,
+            minimum_out_of_sample_trades=30,
+            minimum_train_net_profit_factor=1.20,
+            minimum_validation_net_profit_factor=1.15,
+            minimum_test_net_profit_factor=1.10,
+            minimum_reward_to_cost_ratio=5.0,
+            minimum_net_reward_to_risk_ratio=1.5,
             anticipated_funding_cost_pct=0.0003,
             train_cost_gate_enabled=False,
             enforce_fixed_notional_drawdown=False,
@@ -4347,9 +4412,17 @@ def evaluate_candidate_signal(
 
 
 def candidate_strategy_direction(strategy_id: str) -> str:
-    if strategy_id in (CANDIDATE_TREND_LONG_NAME, CANDIDATE_BREAKOUT_LONG_NAME):
+    if strategy_id in (
+        CANDIDATE_TREND_LONG_NAME,
+        CANDIDATE_BREAKOUT_LONG_NAME,
+        CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+    ):
         return "LONG"
-    if strategy_id in (CANDIDATE_TREND_SHORT_NAME, CANDIDATE_BREAKOUT_SHORT_NAME):
+    if strategy_id in (
+        CANDIDATE_TREND_SHORT_NAME,
+        CANDIDATE_BREAKOUT_SHORT_NAME,
+        CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+    ):
         return "SHORT"
     raise ConfigError(f"Candidate strategy has no fixed direction: {strategy_id}")
 
@@ -4392,6 +4465,28 @@ def evaluate_breakout_candidate_signal(
     if direction == "SHORT" and close_price >= donchian_low:
         return False, "DONCHIAN_LOW_NOT_BROKEN"
     return True, ""
+
+
+def evaluate_regime_pullback_candidate_signal(
+    current: Any,
+    previous: Any,
+    direction: str,
+    params: CandidateReplayParameters,
+) -> Tuple[bool, str, Optional[float]]:
+    if direction not in CANDIDATE_DIRECTIONS:
+        raise ConfigError(f"Unsupported candidate direction: {direction}")
+    try:
+        current_close_time = int(current["close_time"])
+        regime_close_time = int(current["regime_feature_close_time"])
+        regime_side = int(current["regime_side"])
+    except (KeyError, TypeError, ValueError):
+        return False, "MISSING_REGIME_FEATURES", None
+    if regime_close_time > current_close_time:
+        return False, "FUTURE_HIGHER_TIMEFRAME_CANDLE_BLOCKED", None
+    expected_side = 1 if direction == "LONG" else -1
+    if regime_side != expected_side:
+        return False, "REGIME_DIRECTION_MISMATCH", None
+    return evaluate_candidate_signal(current, previous, direction, params)
 
 
 def evaluate_mean_reversion_candidate_signal(
@@ -4874,10 +4969,7 @@ def candidate_replay_strategy(
                 update_candidate_excursions(position, row)
                 trend_side = int(row["trend_side"]) if pd.notna(row["trend_side"]) else 0
                 expected_side = 1 if side == "LONG" else -1
-                if strategy_id in (
-                    CANDIDATE_BREAKOUT_LONG_NAME,
-                    CANDIDATE_BREAKOUT_SHORT_NAME,
-                ):
+                if strategy_id in CANDIDATE_HIGHER_TIMEFRAME_LEDGER_NAMES:
                     regime_side = int(row["regime_side"]) if pd.notna(row.get("regime_side")) else 0
                     trend_invalidated = (
                         trend_side != expected_side or regime_side != expected_side
@@ -4943,6 +5035,17 @@ def candidate_replay_strategy(
             direction = candidate_strategy_direction(strategy_id)
             accepted, reason = evaluate_breakout_candidate_signal(row, direction, params)
             pullback_distance = 0.0
+        elif strategy_id in (
+            CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+            CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+        ):
+            direction = candidate_strategy_direction(strategy_id)
+            accepted, reason, pullback_distance = evaluate_regime_pullback_candidate_signal(
+                row,
+                previous,
+                direction,
+                params,
+            )
         else:
             direction = candidate_strategy_direction(strategy_id)
             accepted, reason, pullback_distance = evaluate_candidate_signal(
@@ -6252,7 +6355,7 @@ def run_candidate_portfolio_replay(
 
 def parse_candidate_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run independent rolling walk-forward strategy validation")
-    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V7)
+    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V8)
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--end-time", default=None)
     parser.add_argument("--cache-file", default=None)
@@ -6280,7 +6383,7 @@ def candidate_replay_main(arguments: Sequence[str]) -> None:
 
 def parse_candidate_portfolio_replay_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run cross-symbol candidate robustness validation")
-    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V7)
+    parser.add_argument("--profile", choices=CANDIDATE_REPLAY_PROFILES, default=CANDIDATE_PROFILE_V8)
     parser.add_argument("--symbols", default="SOLUSDT,BTCUSDT,ETHUSDT,BNBUSDT")
     parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--end-time", default=None)

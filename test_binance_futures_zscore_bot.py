@@ -1498,6 +1498,24 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertEqual(v7.embargo_minutes, v7.max_holding_minutes)
         self.assertEqual(v7.minimum_reward_to_cost_ratio, 5.0)
         self.assertEqual(v7.minimum_net_reward_to_risk_ratio, 2.0)
+        v8 = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V8
+        )
+        self.assertEqual(
+            (v8.source_interval, v8.execution_interval, v8.trend_interval, v8.regime_interval),
+            ("15m", "15m", "1h", "4h"),
+        )
+        self.assertEqual(
+            v8.strategy_ids,
+            (
+                self.module.CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+                self.module.CANDIDATE_REGIME_PULLBACK_SHORT_NAME,
+            ),
+        )
+        self.assertFalse(v8.breakout_enabled)
+        self.assertEqual(v8.target_reward_to_risk_multiple, 2.5)
+        self.assertEqual(v8.minimum_test_net_profit_factor, 1.10)
+        self.assertEqual(v8.embargo_minutes, v8.max_holding_minutes)
         with self.assertRaises(self.module.ConfigError):
             self.module.candidate_replay_parameters_for_profile("unknown")
 
@@ -1507,7 +1525,7 @@ class CostAwareCandidateReplayTests(EnvTestCase):
             ["--profile", self.module.CANDIDATE_PROFILE_V5, "--days", "930"]
         )
 
-        self.assertEqual(defaults.profile, self.module.CANDIDATE_PROFILE_V7)
+        self.assertEqual(defaults.profile, self.module.CANDIDATE_PROFILE_V8)
         self.assertIsNone(defaults.days)
         self.assertEqual(selected.profile, self.module.CANDIDATE_PROFILE_V5)
         self.assertEqual(selected.days, 930)
@@ -1789,6 +1807,115 @@ class CostAwareCandidateReplayTests(EnvTestCase):
         self.assertFalse(accepted)
         self.assertEqual(reason, "PULLBACK_OUTSIDE_ATR_BAND")
         self.assertAlmostEqual(distance, 1.2)
+
+    def test_v8_pullback_requires_closed_aligned_regime(self):
+        params = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V8
+        )
+        current, previous = self._signal_rows(3.0)
+        current.update(
+            {
+                "regime_feature_close_time": current["close_time"],
+                "regime_side": 1,
+                "trend_persistence": params.trend_persistence_bars,
+            }
+        )
+
+        accepted, reason, distance = self.module.evaluate_regime_pullback_candidate_signal(
+            current,
+            previous,
+            "LONG",
+            params,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "")
+        self.assertLessEqual(distance, params.max_pullback_distance_atr)
+
+        rejected, reason, _ = self.module.evaluate_regime_pullback_candidate_signal(
+            {**current, "regime_side": -1},
+            previous,
+            "LONG",
+            params,
+        )
+        self.assertFalse(rejected)
+        self.assertEqual(reason, "REGIME_DIRECTION_MISMATCH")
+
+        rejected, reason, _ = self.module.evaluate_regime_pullback_candidate_signal(
+            {**current, "regime_feature_close_time": current["close_time"] + 1},
+            previous,
+            "LONG",
+            params,
+        )
+        self.assertFalse(rejected)
+        self.assertEqual(reason, "FUTURE_HIGHER_TIMEFRAME_CANDLE_BLOCKED")
+
+    def test_v8_pullback_enters_at_next_fifteen_minute_open(self):
+        params = self.module.candidate_replay_parameters_for_profile(
+            self.module.CANDIDATE_PROFILE_V8
+        )
+        interval_ms = 15 * 60 * 1000
+
+        def row(index, open_price, high, low, close):
+            close_time = (index + 1) * interval_ms - 1
+            return {
+                "open_time": index * interval_ms,
+                "close_time": close_time,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": 100.0,
+                "trend_feature_close_time": close_time,
+                "trend_ema20": 100.0,
+                "trend_ema50": 99.0,
+                "trend_fast_ema": 100.0,
+                "trend_slow_ema": 99.0,
+                "trend_atr": 2.0,
+                "trend_ema_spread_pct": 0.01,
+                "trend_side": 1,
+                "trend_persistence": 10,
+                "long_slope_consistency": 1.0,
+                "short_slope_consistency": 0.0,
+                "regime_feature_close_time": close_time,
+                "regime_fast_ema": 102.0,
+                "regime_slow_ema": 98.0,
+                "regime_slope_pct": 0.01,
+                "regime_side": 1,
+                "atr_execution": 1.0,
+                "atr_execution_pct": 0.01,
+                "atr_execution_percentile": 0.5,
+                "candidate_zscore": 0.0,
+                "donchian_high": 110.0,
+                "donchian_low": 90.0,
+                "volume_ratio": 1.0,
+            }
+
+        frame = self.module.pd.DataFrame(
+            [
+                row(0, 100.0, 100.4, 99.8, 100.2),
+                row(1, 100.1, 101.3, 99.7, 101.0),
+                row(2, 102.0, 106.0, 101.9, 105.5),
+            ]
+        )
+
+        result = self.module.candidate_replay_strategy(
+            self.config,
+            self.filters,
+            frame,
+            0,
+            3 * interval_ms,
+            self.module.CANDIDATE_REGIME_PULLBACK_LONG_NAME,
+            params,
+        )
+
+        self.assertEqual(len(result["trades"]), 1)
+        trade = result["trades"][0]
+        self.assertEqual(trade["entry_price"], 102.0)
+        self.assertEqual(trade["entry_time_ms"], 2 * interval_ms)
+        self.assertEqual(trade["strategy_id"], self.module.CANDIDATE_REGIME_PULLBACK_LONG_NAME)
+        self.assertEqual(trade["side"], "LONG")
+        self.assertEqual(trade["exit_reason"], "TAKE_PROFIT")
 
     def test_atr_entry_risk_profile_is_dynamic_and_bounded(self):
         regular = self.module.candidate_entry_risk_profile(100.0, 0.4, self.params)

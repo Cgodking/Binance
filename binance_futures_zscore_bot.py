@@ -646,6 +646,16 @@ class FeasibilityScanParameters:
     max_risk_pct: float = 0.01
     primary_stop_loss_pct: float = 0.01
     stop_loss_scenarios: Tuple[float, ...] = (0.006, 0.01, 0.015)
+    capital_scenarios_usdt: Tuple[float, ...] = (
+        5.0,
+        7.5,
+        10.0,
+        15.0,
+        20.0,
+        25.0,
+        50.0,
+        100.0,
+    )
     minimum_quote_volume_usdt: float = 10_000_000.0
     maximum_book_spread_pct: float = 0.001
     recommended_symbol_limit: int = 25
@@ -4035,6 +4045,10 @@ def feasibility_scenario_key(stop_loss_pct: float) -> str:
     return f"stop_{float(stop_loss_pct):.6f}"
 
 
+def capital_scenario_key(balance_usdt: float) -> str:
+    return f"balance_{float(balance_usdt):.2f}"
+
+
 def validate_feasibility_scan_parameters(params: FeasibilityScanParameters) -> None:
     if params.balance_usdt <= 0:
         raise ConfigError("Feasibility scan balance must be positive")
@@ -4044,6 +4058,8 @@ def validate_feasibility_scan_parameters(params: FeasibilityScanParameters) -> N
         raise ConfigError("Feasibility scan primary stop loss must be positive")
     if not params.stop_loss_scenarios or any(value <= 0 for value in params.stop_loss_scenarios):
         raise ConfigError("Feasibility scan stop loss scenarios must be positive")
+    if not params.capital_scenarios_usdt or any(value <= 0 for value in params.capital_scenarios_usdt):
+        raise ConfigError("Feasibility scan capital scenarios must be positive")
     if params.minimum_quote_volume_usdt < 0 or params.maximum_book_spread_pct < 0:
         raise ConfigError("Feasibility scan liquidity limits cannot be negative")
     if params.recommended_symbol_limit <= 0:
@@ -4136,6 +4152,35 @@ def build_feasibility_scan_rows(
                 if quote_volume < params.minimum_quote_volume_usdt:
                     liquidity_reasons.append("QUOTE_VOLUME_BELOW_LIMIT")
                 rejection_reasons = ([plan.skip_reason] if plan.skip_reason else []) + liquidity_reasons
+                minimum_order_loss = estimated_worst_case_loss_usdt(
+                    minimum_valid_notional,
+                    stop_loss_pct,
+                    scan_config,
+                )
+                minimum_required_balance_by_risk = minimum_order_loss / params.max_risk_pct
+                required_margin = minimum_valid_notional / config.leverage
+                minimum_required_balance_by_margin = (
+                    required_margin / config.max_account_margin_fraction
+                )
+                minimum_required_balance = max(
+                    minimum_required_balance_by_risk,
+                    minimum_required_balance_by_margin,
+                )
+                capital_independent_reasons = list(liquidity_reasons)
+                if minimum_quantity > filters.max_qty:
+                    capital_independent_reasons.append("MINIMUM_QUANTITY_EXCEEDS_MAXIMUM")
+                capital_scenarios: Dict[str, Dict[str, Any]] = {}
+                for capital in sorted(set(params.capital_scenarios_usdt)):
+                    capital_reasons = list(capital_independent_reasons)
+                    if capital + 1e-12 < minimum_required_balance:
+                        capital_reasons.append("CAPITAL_BELOW_REQUIRED_MINIMUM")
+                    capital_scenarios[capital_scenario_key(capital)] = {
+                        "balance_usdt": capital,
+                        "risk_budget_usdt": capital * params.max_risk_pct,
+                        "margin_budget_usdt": capital * config.max_account_margin_fraction,
+                        "feasible": not capital_reasons,
+                        "rejection_reasons": capital_reasons,
+                    }
                 scenario_results[feasibility_scenario_key(stop_loss_pct)] = {
                     "stop_loss_pct": stop_loss_pct,
                     "quantity": plan.quantity,
@@ -4149,6 +4194,14 @@ def build_feasibility_scan_rows(
                     "risk_sizing_skip_reason": plan.skip_reason,
                     "rejection_reasons": rejection_reasons,
                     "feasible": not rejection_reasons,
+                    "minimum_required_balance_usdt": minimum_required_balance,
+                    "minimum_required_balance_by_risk_usdt": minimum_required_balance_by_risk,
+                    "minimum_required_balance_by_margin_usdt": minimum_required_balance_by_margin,
+                    "required_max_net_loss_usdt": minimum_order_loss,
+                    "required_max_margin_usdt": required_margin,
+                    "required_max_notional_usdt": minimum_valid_notional,
+                    "capital_independent_rejection_reasons": capital_independent_reasons,
+                    "capital_scenarios": capital_scenarios,
                 }
 
             primary = scenario_results[feasibility_scenario_key(params.primary_stop_loss_pct)]
@@ -4170,6 +4223,10 @@ def build_feasibility_scan_rows(
                     "maximum_affordable_stop_loss_pct": maximum_affordable_stop_loss_pct,
                     "primary_stop_loss_pct": params.primary_stop_loss_pct,
                     "minimum_order_estimated_loss_usdt": primary["minimum_order_estimated_loss_usdt"],
+                    "primary_minimum_required_balance_usdt": primary["minimum_required_balance_usdt"],
+                    "primary_required_max_net_loss_usdt": primary["required_max_net_loss_usdt"],
+                    "primary_required_max_margin_usdt": primary["required_max_margin_usdt"],
+                    "primary_required_max_notional_usdt": primary["required_max_notional_usdt"],
                     "risk_budget_usage": primary["risk_budget_usage"],
                     "primary_rejection_reasons": primary["rejection_reasons"],
                     "primary_feasible": primary["feasible"],
@@ -4207,6 +4264,10 @@ def write_feasibility_scan_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> No
         "maximum_affordable_stop_loss_pct",
         "primary_stop_loss_pct",
         "minimum_order_estimated_loss_usdt",
+        "primary_minimum_required_balance_usdt",
+        "primary_required_max_net_loss_usdt",
+        "primary_required_max_margin_usdt",
+        "primary_required_max_notional_usdt",
         "risk_budget_usage",
         "primary_feasible",
         "primary_rejection_reasons",
@@ -4266,10 +4327,52 @@ def run_feasibility_scan(
     for stop_loss_pct in scenario_values:
         key = feasibility_scenario_key(stop_loss_pct)
         feasible_symbols = [row["symbol"] for row in rows if row["stop_loss_scenarios"][key]["feasible"]]
+        structurally_eligible = [
+            row
+            for row in rows
+            if not row["stop_loss_scenarios"][key]["capital_independent_rejection_reasons"]
+        ]
+        structurally_eligible.sort(
+            key=lambda row: row["stop_loss_scenarios"][key]["minimum_required_balance_usdt"]
+        )
+        capital_curve: Dict[str, Dict[str, Any]] = {}
+        for capital in sorted(set(params.capital_scenarios_usdt)):
+            capital_key = capital_scenario_key(capital)
+            capital_symbols = [
+                row["symbol"]
+                for row in rows
+                if row["stop_loss_scenarios"][key]["capital_scenarios"][capital_key]["feasible"]
+            ]
+            capital_curve[capital_key] = {
+                "balance_usdt": capital,
+                "feasible_symbol_count": len(capital_symbols),
+                "feasible_symbols": capital_symbols[: params.recommended_symbol_limit],
+            }
+        sol_row = next((row for row in rows if row["symbol"] == "SOLUSDT"), None)
         scenario_summary[key] = {
             "stop_loss_pct": stop_loss_pct,
             "feasible_symbol_count": len(feasible_symbols),
             "feasible_symbols": feasible_symbols[: params.recommended_symbol_limit],
+            "minimum_required_balance_for_any_eligible_symbol_usdt": (
+                structurally_eligible[0]["stop_loss_scenarios"][key]["minimum_required_balance_usdt"]
+                if structurally_eligible
+                else None
+            ),
+            "lowest_capital_symbols": [
+                {
+                    "symbol": row["symbol"],
+                    "minimum_required_balance_usdt": row["stop_loss_scenarios"][key][
+                        "minimum_required_balance_usdt"
+                    ],
+                }
+                for row in structurally_eligible[: params.recommended_symbol_limit]
+            ],
+            "solusdt_minimum_required_balance_usdt": (
+                sol_row["stop_loss_scenarios"][key]["minimum_required_balance_usdt"]
+                if sol_row is not None
+                else None
+            ),
+            "capital_curve": capital_curve,
         }
 
     generated_at = utc_now_text()
@@ -4283,6 +4386,13 @@ def run_feasibility_scan(
             "minimum_spread_bps_per_side": config.shadow_spread_bps,
             "gap_risk_buffer_pct": config.gap_risk_buffer_pct,
             "observed_book_spread_used_when_higher": True,
+        },
+        "capital_exploration_policy": {
+            "risk_fraction_remains_fixed": params.max_risk_pct,
+            "max_net_loss_scales_with_balance": True,
+            "max_margin_scales_with_account_margin_fraction": config.max_account_margin_fraction,
+            "required_max_notional_is_reported_per_symbol": True,
+            "simulation_only": True,
         },
         "analyzed_symbol_count": len(rows),
         "market_data_error_count": len(errors),
@@ -6765,6 +6875,16 @@ def parse_feasibility_stop_scenarios(value: str) -> Tuple[float, ...]:
     return values
 
 
+def parse_feasibility_capital_scenarios(value: str) -> Tuple[float, ...]:
+    try:
+        values = tuple(float(item.strip()) for item in str(value).split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Capital scenarios must be comma-separated decimal values") from exc
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("Capital scenarios must contain positive values")
+    return values
+
+
 def parse_feasibility_scan_args(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scan the public USD-M perpetual universe for risk feasibility")
     parser.add_argument("--balance", type=float, default=5.0)
@@ -6775,6 +6895,11 @@ def parse_feasibility_scan_args(arguments: Sequence[str]) -> argparse.Namespace:
         "--stop-scenarios",
         type=parse_feasibility_stop_scenarios,
         default=(0.006, 0.01, 0.015),
+    )
+    parser.add_argument(
+        "--capital-scenarios",
+        type=parse_feasibility_capital_scenarios,
+        default=(5.0, 7.5, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0),
     )
     parser.add_argument("--minimum-quote-volume", type=float, default=10_000_000.0)
     parser.add_argument("--maximum-book-spread-pct", type=float, default=0.001)
@@ -6792,6 +6917,7 @@ def feasibility_scan_main(arguments: Sequence[str]) -> None:
         max_risk_pct=args.max_risk_pct,
         primary_stop_loss_pct=args.primary_stop_pct,
         stop_loss_scenarios=args.stop_scenarios,
+        capital_scenarios_usdt=args.capital_scenarios,
         minimum_quote_volume_usdt=args.minimum_quote_volume,
         maximum_book_spread_pct=args.maximum_book_spread_pct,
         recommended_symbol_limit=args.recommended_symbol_limit,

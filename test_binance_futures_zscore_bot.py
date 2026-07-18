@@ -2796,6 +2796,41 @@ class FeasibilityScannerTests(EnvTestCase):
             by_symbol["LOWUSDT"]["stop_loss_scenarios"]["stop_0.010000"]["feasible"]
         )
 
+    def test_capital_explorer_inverts_risk_and_margin_constraints(self):
+        exchange_info, books, tickers = self.market_payloads()
+        params = self.module.FeasibilityScanParameters(
+            primary_stop_loss_pct=0.01,
+            stop_loss_scenarios=(0.01,),
+            capital_scenarios_usdt=(5.0, 7.5, 10.0, 150.0),
+        )
+
+        rows, errors = self.module.build_feasibility_scan_rows(
+            exchange_info,
+            books,
+            tickers,
+            self.config,
+            params,
+        )
+        by_symbol = {row["symbol"]: row for row in rows}
+        low = by_symbol["LOWUSDT"]["stop_loss_scenarios"]["stop_0.010000"]
+        btc = by_symbol["BTCUSDT"]["stop_loss_scenarios"]["stop_0.010000"]
+
+        self.assertEqual(errors, {})
+        self.assertGreater(low["minimum_required_balance_usdt"], 6.0)
+        self.assertLess(low["minimum_required_balance_usdt"], 7.0)
+        self.assertAlmostEqual(
+            low["required_max_net_loss_usdt"] / params.max_risk_pct,
+            low["minimum_required_balance_by_risk_usdt"],
+        )
+        self.assertAlmostEqual(
+            low["required_max_margin_usdt"] / self.config.max_account_margin_fraction,
+            low["minimum_required_balance_by_margin_usdt"],
+        )
+        self.assertFalse(low["capital_scenarios"]["balance_5.00"]["feasible"])
+        self.assertTrue(low["capital_scenarios"]["balance_7.50"]["feasible"])
+        self.assertGreater(btc["minimum_required_balance_usdt"], 100.0)
+        self.assertTrue(btc["capital_scenarios"]["balance_150.00"]["feasible"])
+
     def test_run_scanner_uses_public_endpoints_and_writes_reports(self):
         exchange_info, books, tickers = self.market_payloads()
 
@@ -2840,6 +2875,18 @@ class FeasibilityScannerTests(EnvTestCase):
         self.assertFalse(report["account_state_changed"])
         self.assertFalse(report["live_trading"])
         self.assertEqual(report["research_decision"], "RESEARCH_UNIVERSE_AVAILABLE")
+        self.assertTrue(report["capital_exploration_policy"]["simulation_only"])
+        capital_curve = report["scenario_summary"]["stop_0.010000"]["capital_curve"]
+        self.assertEqual(capital_curve["balance_5.00"]["feasible_symbol_count"], 0)
+        self.assertEqual(capital_curve["balance_7.50"]["feasible_symbols"], ["LOWUSDT"])
+
+    def test_capital_scenario_cli_parser(self):
+        args = self.module.parse_feasibility_scan_args(
+            ["--capital-scenarios", "5,12.5,25", "--stop-scenarios", "0.01"]
+        )
+
+        self.assertEqual(args.capital_scenarios, (5.0, 12.5, 25.0))
+        self.assertEqual(args.stop_scenarios, (0.01,))
 
     def test_scanner_rejects_any_non_shadow_configuration(self):
         params = self.module.FeasibilityScanParameters()
